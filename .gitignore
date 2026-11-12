@@ -1,0 +1,23 @@
+﻿# Build output
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/target-*/
+src-tauri/gen/
+portable/
+
+# Test output and one-off diagnostics
+tests/out/
+tests/probe*.mjs
+tests/peek.mjs
+tests/07-keytrace.mjs
+
+# Local working files, never published
+REFERENCE.md
+backup-*.zip
+Capture.PNG
+src-tauri/nobuild.json
+data/
+*.log
+.env
+.env.*

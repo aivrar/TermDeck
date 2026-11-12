@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TermDeck</title>
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <div class="sb-head">
+          <span class="brand">TermDeck</span>
+          <span class="sb-acts">
+            <button id="btn-open" class="btn" title="Open a past conversation from a list (Ctrl+Shift+O)">Open…</button>
+            <button id="btn-new" class="btn primary" title="New session (Ctrl+Shift+T)">+ New</button>
+          </span>
+        </div>
+        <div class="resume-all" id="resume-all" hidden>
+          <button id="btn-resume-all" class="btn small primary" title="Start every waiting session again, each with its own command"></button>
+        </div>
+        <div id="tablist"></div>
+        <div class="sb-sys" id="sys-usage" title="The whole PC: processor and memory in use right now"></div>
+        <div class="sb-foot">
+          <button id="btn-updates" class="btn small ghost" title="Versions of Claude Code, Codex and Grok, updating them, and what happens at startup">Updates</button>
+          <button id="btn-settings" class="btn small ghost" title="Font, colours, history length, notifications, what counts as a heavy tab, startup">Settings</button>
+          <div class="seg" id="split-seg" title="How many terminals to show side by side">
+            <button data-n="1">1</button><button data-n="2">2</button><button data-n="3">3</button>
+          </div>
+          <div class="zoom" title="Text size (Ctrl + / Ctrl - / Ctrl 0, or Ctrl + mouse wheel)">
+            <button id="zoom-out">−</button><span id="zoom-val">14</span><button id="zoom-in">+</button>
+          </div>
+        </div>
+      </aside>
+      <div class="vhandle" id="h-left"></div>
+      <main id="main">
+        <div id="panes"></div>
+        <div id="quickbar"></div>
+      </main>
+      <div class="vhandle" id="h-right"></div>
+      <aside id="library"></aside>
+    </div>
+    <div id="parking"></div>
+    <div id="menu-root"></div>
+    <div id="modal-root"></div>
+    <div id="toasts"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

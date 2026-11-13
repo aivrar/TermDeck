@@ -171,7 +171,7 @@ try {
           byIdFound: byId?.found ?? null,
           byIdRight: byId ? byId.path.includes(real.id) : null,
           missFound: miss.found,
-          folderHasOne: noId.found,
+          noIdFound: noId.found,
           exists: real ? await api.sessionExists(cli, real.id) : null,
           existsUnknown: await api.sessionExists(cli, unknown),
           existsBad: await api.sessionExists(cli, '..\\..\\..\\Windows\\win'),
@@ -186,8 +186,11 @@ try {
         continue;
       }
       check(`${cli}: a conversation is found by its id alone, whatever folder is named`, c.byIdFound === true && c.byIdRight === true, JSON.stringify(c));
-      check(`${cli}: an id that is not there shows nothing — not another conversation from the same folder`, c.missFound === false && c.folderHasOne === true,
-        `unknown id found: ${c.missFound}; the folder does hold a conversation: ${c.folderHasOne}`);
+      // `real` is a conversation in that very folder, so there is one to wrongly show.
+      check(`${cli}: an id that is not there shows nothing — not another conversation from the same folder`, c.missFound === false,
+        `unknown id found: ${c.missFound}`);
+      check(`${cli}: no id yet shows nothing either — no guessing with the folder's newest conversation`, c.noIdFound === false,
+        `found without an id: ${c.noIdFound}`);
       check(`${cli}: "is there a saved conversation" — no for an unknown id, no for something that is not an id`, c.existsUnknown === false && c.existsBad === false, JSON.stringify(c));
     }
 

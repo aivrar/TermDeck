@@ -1,7 +1,7 @@
 {
   "name": "termdeck",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Portable multi-session terminal for the Claude Code, Codex and Grok CLIs on Windows",
   "license": "MIT",
   "repository": "github:aivrar/TermDeck",

@@ -44,6 +44,8 @@ fn quiet(program: &str, args: &[&str], limit: Duration) -> Option<String> {
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .ok()?;
+    // In a job of its own: whatever it starts ends with it, also when it is given up on.
+    let job = crate::usage::Job::for_process(child.id(), crate::usage::OnClose::End);
     // Read on a thread of its own, so a helper that never answers cannot hold this one.
     let mut pipe = child.stdout.take()?;
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
@@ -58,8 +60,15 @@ fn quiet(program: &str, args: &[&str], limit: Duration) -> Option<String> {
             Ok(Some(status)) => break status,
             Ok(None) if began.elapsed() < limit => std::thread::sleep(Duration::from_millis(25)),
             _ => {
+                if let Some(job) = &job {
+                    job.terminate();
+                }
                 let _ = child.kill();
-                let _ = child.wait();
+                // Never waits for good: a helper that will not end is given up on.
+                let gone = Instant::now();
+                while gone.elapsed() < Duration::from_secs(2) && matches!(child.try_wait(), Ok(None)) {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
                 return None;
             }
         }

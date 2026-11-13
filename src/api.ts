@@ -49,6 +49,16 @@ export interface SystemUsage {
   memUsed: number;
   memTotal: number;
   cores: number;
+  /** The WSL virtual machine is running; it is shared, so no tab counts it. */
+  wsl: boolean;
+  wslCpu: number;
+  wslMem: number;
+}
+
+/** What ending processes left behind: how many were set to be ended, and the names of any still running. */
+export interface Ended {
+  targeted: number;
+  survivors: string[];
 }
 
 export interface CliVersion {
@@ -126,19 +136,19 @@ export const api = {
   dataDir: () => invoke<string>('data_dir_path'),
 
   ptySpawn: (args: SpawnArgs, onEvent: Channel<PtyEvent>) =>
-    invoke<{ pid: number | null }>('pty_spawn', { args, onEvent }),
+    invoke<{ pid: number | null; tracked: boolean }>('pty_spawn', { args, onEvent }),
   ptyWrite: (id: string, data: string) => invoke<void>('pty_write', { id, data }),
   ptyResize: (id: string, cols: number, rows: number) => invoke<void>('pty_resize', { id, cols, rows }),
   ptyAck: (id: string, n: number) => invoke<void>('pty_ack', { id, n }),
-  /** Closes tabs for good: everything they started is ended. Returns how many by force. */
-  ptyClose: (ids: string[]) => invoke<number>('pty_close', { ids }),
+  /** Closes tabs for good: everything they started is ended. Says what could not be. */
+  ptyClose: (ids: string[]) => invoke<Ended>('pty_close', { ids }),
   /** The same for every tab there is. */
-  ptyKillAll: () => invoke<number>('pty_kill_all'),
+  ptyKillAll: () => invoke<Ended>('pty_kill_all'),
 
   pollStatus: (tabs: { id: string; pty: string; pid: number; cwd: string; session: string | null; input: number | null }[]) =>
     invoke<{ tabs: TabStatus[]; system: SystemUsage }>('poll_status', { tabs }),
-  /** Ends everything a tab has started, its shell included. Returns how many. */
-  ptyKillTree: (id: string) => invoke<number>('pty_kill_tree', { id }),
+  /** Ends everything a tab has started, its shell included, and says what could not be. */
+  ptyKillTree: (id: string) => invoke<Ended>('pty_kill_tree', { id }),
   procKill: (id: string, pid: number) => invoke<boolean>('proc_kill', { id, pid }),
   tabPriority: (id: string, low: boolean) => invoke<number>('tab_priority', { id, low }),
   /** Ends what is running in a tab but keeps its shell. */
@@ -156,6 +166,8 @@ export const api = {
   sessionsList: (cli: string, cwd: string | null, limit: number) => invoke<SessionInfo[]>('sessions_list', { cli, cwd, limit }),
   /** Flashes the taskbar button until the window is brought to the front. */
   attention: (on: boolean) => invoke<void>('attention', { on }),
+  /** "This window has the close request" — without it the backend treats the window as hung. */
+  closeSeen: () => invoke<void>('close_seen'),
 
   storeLoad: <T>(name: string) => invoke<T | null>('store_load', { name }),
   storeSave: (name: string, value: unknown) => invoke<void>('store_save', { name, value }),

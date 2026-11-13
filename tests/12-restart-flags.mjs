@@ -100,7 +100,11 @@ try {
   t = await tabs(page);
   check('…each started with its own switches again', t[viaDialog].flags === '' && t[typed].flags === '--verbose' && t[fullPath].flags === '--verbose', `"${t[viaDialog].flags}" | "${t[typed].flags}" | "${t[fullPath].flags}"`);
   check('"Resume all" goes away once nothing is waiting', !(await all.isVisible()));
-  check('Claude is in full-screen mode in all three', [viaDialog, typed, fullPath].every((i) => t[i].buffer === 'alternate'), [viaDialog, typed, fullPath].map((i) => t[i].buffer).join(', '));
+  // Claude switches to full-screen only once it has loaded the conversation it resumes:
+  // seconds after it starts, more for a longer conversation.
+  const full = await until(async () => { const x = await tabs(page); return [viaDialog, typed, fullPath].every((i) => x[i].buffer === 'alternate') ? x : false; }, 20000);
+  t = full || (await tabs(page));
+  check('Claude is in full-screen mode in all three', !!full, [viaDialog, typed, fullPath].map((i) => t[i].buffer).join(', '));
   await shot(page, '12-c-resumed-all');
 
   // ---- E. a switch for every session of a CLI, and one set by hand for a tab ----

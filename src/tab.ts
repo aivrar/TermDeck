@@ -3,7 +3,8 @@ import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import { WebLinksAddon } from '@xterm/addon-web-links';
-import { api, Channel, type CliKind, type EnvInfo, type ProcUsage, type PtyEvent, type ShellKind, type TabStatus } from './api';
+import { api, Channel, type CliKind, type Ended, type EnvInfo, type ProcUsage, type PtyEvent, type ShellKind, type TabStatus } from './api';
+import { toast } from './ui';
 
 export type Activity = 'idle' | 'working' | 'attention' | 'done' | 'exited';
 
@@ -563,6 +564,10 @@ export class Tab {
         channel,
       );
       this.pid = info.pid;
+      if (info.pid && !info.tracked && !this.disposed) {
+        // Rare (Windows refused a job): said once, so usage and Kill are not trusted blindly.
+        this.term.write('\r\n\x1b[33m[TermDeck could not give this shell a job of its own: programs it starts are followed only while their parent runs, and may not be counted or stopped with the tab]\x1b[0m\r\n');
+      }
     } catch (e) {
       this.ptyId = null;
       this.exited = true;
@@ -911,11 +916,19 @@ export class Tab {
   kill(): void {
     const ids = [...new Set([this.ptyId, this.procId].filter((id): id is string => !!id))];
     if (!ids.length) return;
-    void api.ptyClose(ids).then((forced) => {
+    const name = this.title || this.state.cwd;
+    void api.ptyClose(ids).then((res) => {
       Tab.closed++;
-      Tab.forced += forced;
+      Tab.forced += res.targeted;
+      if (res.survivors.length) {
+        Tab.survivors.push(...res.survivors);
+        toast(`The tab "${name}" was closed, but ${survivorText(res.survivors)} could not be ended (Windows refused — it may be running as administrator). End it from Task Manager.`, 'error', 12000);
+      }
     }).catch(() => {});
   }
+
+  /** Names of programs that closing or Kill could not end (for tests and diagnosis). */
+  static survivors: string[] = [];
 
   /** Tabs closed so far, and how many processes had to be ended by force in all (for tests and diagnosis). */
   static closed = 0;
@@ -924,10 +937,11 @@ export class Tab {
   /**
    * Emergency stop: ends every process this tab has started — the CLI, whatever it
    * launched, and leftovers whose parent already quit — then brings the shell back
-   * in the same folder with Resume offered. Returns how many processes were ended.
+   * in the same folder with Resume offered. Says how many processes were ended, and
+   * names any that are still running afterwards.
    */
-  async killEverything(): Promise<number> {
-    if (!this.procId) return 0;
+  async killEverything(): Promise<Ended> {
+    if (!this.procId) return { targeted: 0, survivors: [] };
     const id = this.procId;
     let ended = 0;
     if (!this.exited) {
@@ -947,10 +961,15 @@ export class Tab {
       }
     }
     try {
-      return ended + (await api.ptyKillTree(id));
+      const res = await api.ptyKillTree(id);
+      if (res.survivors.length && !this.disposed) {
+        Tab.survivors.push(...res.survivors);
+        this.term.write(`\r\n\x1b[91m[could not be stopped, still running: ${survivorText(res.survivors)} — Windows refused; it may be running as administrator]\x1b[0m\r\n`);
+      }
+      return { targeted: ended + res.targeted, survivors: res.survivors };
     } catch {
       this.afterKill = null;
-      return ended;
+      return { targeted: ended, survivors: [] };
     }
   }
 
@@ -1012,11 +1031,13 @@ export class Tab {
   }
 
   /** Low priority: the tab's work continues, but only on CPU nothing else wants. */
-  async setLowPriority(low: boolean): Promise<void> {
-    if (!this.procId) return;
-    await api.tabPriority(this.procId, low).catch(() => 0);
-    this.lowPriority = low;
+  async setLowPriority(low: boolean): Promise<boolean> {
+    if (!this.procId) return false;
+    const changed = await api.tabPriority(this.procId, low).catch(() => 0);
+    // Shown as low only if it took; "back to normal" always clears the mark.
+    this.lowPriority = low && changed > 0;
     this.host.changed(this);
+    return changed > 0;
   }
 
   // ---------- keys ----------
@@ -1351,4 +1372,12 @@ export class Tab {
     this.term.dispose();
     this.el.remove();
   }
+}
+
+/** "chrome.exe", "chrome.exe ×3 and node.exe": names of processes, counted. */
+export function survivorText(names: string[]): string {
+  const counts = new Map<string, number>();
+  for (const n of names) counts.set(n, (counts.get(n) ?? 0) + 1);
+  const parts = [...counts].map(([n, c]) => (c > 1 ? `${n} ×${c}` : n));
+  return parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts.at(-1)}` : parts[0] ?? '';
 }

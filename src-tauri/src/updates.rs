@@ -6,6 +6,7 @@
 //! (`grok update --check`) and, for the other two, the public npm registry.
 
 use crate::status;
+use crate::usage::{Job, OnClose};
 use serde::Serialize;
 use std::io::Read;
 use std::os::windows::process::CommandExt;
@@ -61,7 +62,13 @@ fn strip_ansi(s: &str) -> String {
 
 /// Runs one command line hidden, the way a shell would resolve it, with the same PATH
 /// the tabs get. Output (stdout and stderr together) is captured; nothing can prompt.
-fn run(line: &str, timeout: Duration) -> Ran {
+///
+/// It runs in a job of its own, which nothing it starts can leave: on timeout the
+/// whole job is ended at once — programs whose parent already exited included. With
+/// `OnClose::End` (version checks) anything it leaves running is ended when it is done,
+/// and if TermDeck itself goes; `OnClose::Keep` (an update) is never stopped halfway by
+/// that, only by the timeout.
+fn run(line: &str, timeout: Duration, on_close: OnClose) -> Ran {
     let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into());
     let spawned = Command::new("cmd.exe")
         .args(["/D", "/C"])
@@ -78,6 +85,15 @@ fn run(line: &str, timeout: Duration) -> Ran {
         Ok(c) => c,
         Err(e) => return Ran { code: None, out: format!("could not start: {e}"), timed_out: false },
     };
+    let job = Job::for_process(child.id(), on_close);
+    if let Some(job) = &job {
+        // Anything it managed to start before it was put in the job goes in too.
+        for (pid, _) in status::tree_exact(child.id()) {
+            if pid != child.id() {
+                job.adopt(pid);
+            }
+        }
+    }
     // What it prints is collected as it comes, and only the last part is kept: an
     // updater that prints megabytes of progress must not be held in memory whole.
     const KEEP: usize = 512 * 1024;
@@ -109,13 +125,21 @@ fn run(line: &str, timeout: Duration) -> Ran {
             Ok(None) => {
                 if started.elapsed() > timeout {
                     timed_out = true;
-                    // End it and whatever it started, so nothing is left half-running.
-                    // Each one only if it is still the process that was listed.
+                    // End it and whatever it started, so nothing is left half-running:
+                    // the whole job at once, and (should there be no job) the tree,
+                    // each one only if it is still the process that was listed.
+                    if let Some(job) = &job {
+                        job.terminate();
+                    }
                     for (pid, born) in status::tree_exact(child.id()) {
                         crate::usage::kill_exact(pid, born);
                     }
                     let _ = child.kill();
-                    let _ = child.wait();
+                    // Never waits for good: it is reported as timed out either way.
+                    let gone = Instant::now();
+                    while gone.elapsed() < Duration::from_secs(5) && matches!(child.try_wait(), Ok(None)) {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                     break None;
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -192,12 +216,12 @@ pub fn cli_versions() -> Vec<CliVersion> {
     let short = Duration::from_secs(20);
     let net = Duration::from_secs(30);
     let jobs: Vec<(&str, std::thread::JoinHandle<Ran>)> = vec![
-        ("claude", std::thread::spawn(move || run("claude --version", short))),
-        ("codex", std::thread::spawn(move || run("codex --version", short))),
-        ("grok", std::thread::spawn(move || run("grok update --check --json", net))),
-        ("grok-v", std::thread::spawn(move || run("grok --version", short))),
-        ("npm-codex", std::thread::spawn(move || run("npm view @openai/codex version", net))),
-        ("npm-claude", std::thread::spawn(move || run("npm view @anthropic-ai/claude-code dist-tags --json", net))),
+        ("claude", std::thread::spawn(move || run("claude --version", short, OnClose::End))),
+        ("codex", std::thread::spawn(move || run("codex --version", short, OnClose::End))),
+        ("grok", std::thread::spawn(move || run("grok update --check --json", net, OnClose::End))),
+        ("grok-v", std::thread::spawn(move || run("grok --version", short, OnClose::End))),
+        ("npm-codex", std::thread::spawn(move || run("npm view @openai/codex version", net, OnClose::End))),
+        ("npm-claude", std::thread::spawn(move || run("npm view @anthropic-ai/claude-code dist-tags --json", net, OnClose::End))),
     ];
     let mut got = std::collections::HashMap::new();
     for (name, handle) in jobs {
@@ -274,7 +298,7 @@ pub fn cli_update(cli: String) -> Result<UpdateResult, String> {
     // Test hook: with TERMDECK_UPDATE_DRYRUN set, nothing is installed — the CLI is only
     // asked for its version, so the stop / update / resume sequence can be exercised.
     let line = if std::env::var_os("TERMDECK_UPDATE_DRYRUN").is_some() { format!("{cli} --version") } else { real.to_string() };
-    let r = run(&line, Duration::from_secs(15 * 60));
+    let r = run(&line, Duration::from_secs(15 * 60), OnClose::Keep);
     let mut output = r.out.trim().to_string();
     if output.chars().count() > 6000 {
         let skip = output.chars().count() - 6000;
@@ -298,17 +322,24 @@ mod tests {
     #[test]
     fn output_survives_a_program_left_running() {
         let began = Instant::now();
-        let r = run("echo it-printed-this& start /b ping -n 9 127.0.0.1 >nul", Duration::from_secs(30));
+        let r = run("echo it-printed-this& start /b ping -n 9 127.0.0.1 >nul", Duration::from_secs(30), OnClose::End);
         assert_eq!(r.code, Some(0));
         assert!(!r.timed_out);
         assert!(r.out.contains("it-printed-this"), "got: {:?}", r.out);
         assert!(began.elapsed() < Duration::from_secs(7), "did not wait for the left-over program: {:?}", began.elapsed());
+        // …and what it left running is ended with its job, not left behind.
+        std::thread::sleep(Duration::from_millis(500));
+        let left = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "@(Get-CimInstance Win32_Process -Filter \"Name='PING.EXE'\" | ? { $_.CommandLine -match '-n 9 127' }).Count"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&left.stdout).trim(), "0", "the program it left running is still there");
     }
 
     #[test]
     fn only_the_end_of_very_long_output_is_kept() {
         // About 3 MB of lines, then a last line.
-        let r = run("(for /L %i in (1,1,40000) do @echo line %i 0123456789012345678901234567890123456789012345678901234567890123456789) & echo the-last-line", Duration::from_secs(120));
+        let r = run("(for /L %i in (1,1,40000) do @echo line %i 0123456789012345678901234567890123456789012345678901234567890123456789) & echo the-last-line", Duration::from_secs(120), OnClose::End);
         assert_eq!(r.code, Some(0));
         assert!(r.out.len() <= 1_100_000, "kept {} bytes", r.out.len());
         assert!(r.out.trim_end().ends_with("the-last-line"));

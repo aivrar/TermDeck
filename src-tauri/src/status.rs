@@ -91,19 +91,36 @@ fn tree_from(root: u32, expected: Option<u64>) -> Vec<(u32, u64)> {
     if expected.is_some_and(|e| e != root_born) {
         return Vec::new();
     }
+    // Children looked up by parent, once: the walk stays quick however many processes
+    // the machine (or a runaway tab) has — which is exactly when it is needed.
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for p in &procs {
+        if p.pid != 0 && p.pid != p.ppid {
+            children.entry(p.ppid).or_default().push(p.pid);
+        }
+    }
     let mut out = vec![(root, root_born)];
+    let mut seen: HashSet<u32> = HashSet::from([root]);
     let mut i = 0;
     while i < out.len() {
         let parent = out[i].0;
-        for p in &procs {
-            if p.ppid == parent && p.pid != 0 && p.pid != p.ppid && !out.iter().any(|o| o.0 == p.pid) && born.is_child(parent, p.pid) {
-                if let Some(b) = born.of(p.pid) {
-                    out.push((p.pid, b));
+        for &pid in children.get(&parent).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if !seen.contains(&pid) && born.is_child(parent, pid) {
+                if let Some(b) = born.of(pid) {
+                    seen.insert(pid);
+                    out.push((pid, b));
                 }
             }
         }
         i += 1;
     }
+    out
+}
+
+/// The names of the given processes, as Windows lists them now (gone ones left out).
+pub(crate) fn names_of(pids: &HashSet<u32>) -> Vec<String> {
+    let mut out: Vec<String> = snapshot().into_iter().filter(|p| pids.contains(&p.pid)).map(|p| p.name).collect();
+    out.sort();
     out
 }
 
@@ -126,18 +143,48 @@ pub(crate) fn with_ancestors(pid: u32, stop: u32) -> Vec<u32> {
 
 /// The process ids of every Claude Code, Codex or Grok process on the PC.
 pub(crate) fn cli_pids() -> HashSet<u32> {
-    snapshot().into_iter().filter(|p| classify(&p.name).is_some()).map(|p| p.pid).collect()
+    snapshot().into_iter().filter(|p| classify_proc(p).is_some()).map(|p| p.pid).collect()
 }
 
 /// How many processes of each CLI are running on the whole PC.
 pub(crate) fn cli_process_counts() -> HashMap<String, u32> {
     let mut out = HashMap::new();
     for p in snapshot() {
-        if let Some(kind) = classify(&p.name) {
+        if let Some(kind) = classify_proc(&p) {
             *out.entry(kind.to_string()).or_insert(0) += 1;
         }
     }
     out
+}
+
+/// Which CLI a process is, if any: by its program name, or — for Claude Code installed
+/// from npm, which runs as `node.exe …\@anthropic-ai\claude-code\cli.js` — by what
+/// node was started with. (Codex from npm starts its own `codex-….exe`, found by name.)
+fn classify_proc(p: &Proc) -> Option<&'static str> {
+    classify(&p.name).or_else(|| (p.name == "node.exe" && node_runs_claude(p.pid)).then_some("claude"))
+}
+
+/// Whether a node process is Claude Code. Remembered per process (id and creation
+/// time), so each node is asked about its command line once, not every second.
+fn node_runs_claude(pid: u32) -> bool {
+    static SEEN: std::sync::Mutex<Option<HashMap<u32, (u64, bool)>>> = std::sync::Mutex::new(None);
+    let Some(born) = crate::usage::created(pid) else { return false };
+    let mut guard = SEEN.lock().unwrap();
+    let seen = guard.get_or_insert_with(HashMap::new);
+    if let Some(&(b, is)) = seen.get(&pid) {
+        if b == born {
+            return is;
+        }
+    }
+    let is = crate::usage::arguments(pid).iter().any(|a| {
+        let a = a.to_ascii_lowercase().replace('/', "\\");
+        a.contains("@anthropic-ai\\claude-code\\")
+    });
+    if seen.len() > 1024 {
+        seen.clear();
+    }
+    seen.insert(pid, (born, is));
+    is
 }
 
 /// The WebView2 processes that draw this app's window.
@@ -262,7 +309,7 @@ pub struct Poll {
     system: SystemUsage,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ClaudeSession {
     session_id: Option<String>,
@@ -273,8 +320,7 @@ struct ClaudeSession {
 }
 
 fn claude_session(pid: u32) -> Option<ClaudeSession> {
-    let home = std::env::var("USERPROFILE").ok()?;
-    let path = std::path::Path::new(&home).join(".claude").join("sessions").join(format!("{pid}.json"));
+    let path = crate::transcript::cli_home("claude").join("sessions").join(format!("{pid}.json"));
     // The file is named after the process id, and Windows reuses ids. A file last
     // written before this process even started belongs to an earlier Claude that had
     // the same id (and did not clean up): it must not lend its session to this one.
@@ -285,6 +331,117 @@ fn claude_session(pid: u32) -> Option<ClaudeSession> {
     }
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+/// What the CLIs' own files said: per Claude process its live-session file, per tab
+/// (Codex, Grok) its session and state.
+#[derive(Default, Clone)]
+struct FileFacts {
+    claude: HashMap<u32, Option<ClaudeSession>>,
+    lives: HashMap<String, crate::sessions::Live>,
+}
+
+/// The last complete reading, for when a fresh one does not arrive in time.
+static FACTS: std::sync::Mutex<Option<FileFacts>> = std::sync::Mutex::new(None);
+/// A reading is under way (at most one at a time).
+static READING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// How long a status look waits for the files.
+const FILE_BUDGET: Duration = Duration::from_millis(1000);
+
+/// Reads the CLIs' files for this look — on a reader of its own, and for at most
+/// `FILE_BUDGET`. Normally that takes milliseconds. On a disk that has stalled (a
+/// sleeping network drive, a failing disk, a virus scanner holding a file) the look
+/// goes on without waiting: usage, the process list and Kill stay live, and status
+/// shows what was last read until the reader is back. A stalled reader is never
+/// joined by a second one.
+fn read_files(app: &tauri::AppHandle, claude: Vec<u32>, wants: Vec<Want>) -> FileFacts {
+    use std::sync::atomic::Ordering;
+    if !READING.swap(true, Ordering::SeqCst) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let app = app.clone();
+        std::thread::spawn(move || {
+            let facts = FileFacts {
+                claude: claude.iter().map(|&pid| (pid, claude_session(pid))).collect(),
+                lives: tauri::Manager::state::<SessionCache>(&app).resolve(&wants),
+            };
+            *FACTS.lock().unwrap() = Some(facts.clone());
+            READING.store(false, Ordering::SeqCst);
+            let _ = tx.send(facts);
+        });
+        if let Ok(facts) = rx.recv_timeout(FILE_BUDGET) {
+            return facts;
+        }
+    }
+    FACTS.lock().unwrap().clone().unwrap_or_default()
+}
+
+// ---------- letting a just-started Claude Code get past its start ----------
+//
+// Claude Code (seen in 2.1.323) records each full-screen start in its `.claude.json`
+// (`fullscreenBootPending`) and clears the record once it has drawn for 10 s, or when it
+// quits normally. A start that finds the record of a Claude that is gone counts that as
+// a failed start, and after two Claude turns full-screen off on the whole PC. A Claude
+// closed in its first seconds tends not to get as far as quitting normally — it is ended
+// a few seconds later (by Windows' console-close timeout, or by force) and leaves its
+// record behind. So before a Claude is closed, stopped or closed for an update, it is
+// given the moment to get past that: until it is `SETTLE_MIN_AGE` old and its record
+// is gone (read-only), but never longer than `SETTLE_MAX_WAIT`. Only ever noticeable
+// when a Claude is closed right after it was started.
+
+const SETTLE_MIN_AGE: Duration = Duration::from_secs(12);
+const SETTLE_MAX_AGE: Duration = Duration::from_secs(25);
+const SETTLE_MAX_WAIT: Duration = Duration::from_secs(20);
+
+/// The processes Claude Code currently lists as "full-screen start not yet confirmed",
+/// or None if that could not be read quickly (then only the age rule applies).
+fn claude_boot_pending() -> Option<HashSet<u32>> {
+    let file = match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        Some(dir) => std::path::PathBuf::from(dir).join(".claude.json"),
+        None => crate::transcript::home().join(".claude.json"),
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let ids = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).map(|v| {
+            v.get("fullscreenBootPending")
+                .and_then(|p| p.as_object())
+                .map(|o| o.keys().filter_map(|k| k.parse::<u32>().ok()).collect::<HashSet<u32>>())
+                .unwrap_or_default()
+        });
+        let _ = tx.send(ids);
+    });
+    rx.recv_timeout(Duration::from_millis(500)).ok().flatten()
+}
+
+/// Waits until every Claude Code among these processes is past its full-screen start
+/// (see above), or gone. Returns at once when there is none.
+pub(crate) fn settle_claudes(pids: &[u32]) {
+    let claudes: Vec<(u32, u64, SystemTime)> = snapshot()
+        .iter()
+        .filter(|p| pids.contains(&p.pid) && classify_proc(p) == Some("claude"))
+        .filter_map(|p| Some((p.pid, crate::usage::created(p.pid)?, process_start(p.pid)?)))
+        .collect();
+    if claudes.is_empty() {
+        return;
+    }
+    let began = std::time::Instant::now();
+    while began.elapsed() < SETTLE_MAX_WAIT {
+        let young: Vec<&(u32, u64, SystemTime)> = claudes
+            .iter()
+            .filter(|(pid, born, _)| crate::usage::alive_exact(*pid, *born))
+            .filter(|(_, _, start)| start.elapsed().unwrap_or_default() < SETTLE_MAX_AGE)
+            .collect();
+        if young.is_empty() {
+            return;
+        }
+        let too_new = young.iter().any(|(_, _, start)| start.elapsed().unwrap_or_default() < SETTLE_MIN_AGE);
+        if !too_new {
+            match claude_boot_pending() {
+                Some(pending) if young.iter().any(|(pid, _, _)| pending.contains(pid)) => {}
+                _ => return,
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn classify(name: &str) -> Option<&'static str> {
@@ -302,7 +459,7 @@ fn classify(name: &str) -> Option<&'static str> {
 
 #[tauri::command(async)]
 pub fn poll_status(
-    cache: State<'_, SessionCache>,
+    app: tauri::AppHandle,
     ptys: State<'_, PtyManager>,
     usage: State<'_, UsageCache>,
     tabs: Vec<PollTab>,
@@ -319,18 +476,25 @@ pub fn poll_status(
         }
     }
 
-    let mut found: Vec<(TabStatus, HashSet<u32>)> = tabs
+    let found: Vec<(TabStatus, HashSet<u32>, Vec<u32>)> = tabs
         .into_iter()
         .map(|t| {
             let cwd = t.cwd;
             let hint = t.session;
             let input = t.input.map(|ms| UNIX_EPOCH + Duration::from_millis(ms));
             let mut st = TabStatus { id: t.id, ..Default::default() };
+            // Claude processes in the tab, nearest the shell first. Which of them is the
+            // tab's Claude (the one with a live-session file, else the first) is settled
+            // once the files have been read, below.
+            let mut claudes: Vec<u32> = Vec::new();
             // Breadth-first, so the CLI nearest the shell wins over anything it spawned.
             // A tab whose shell has ended (pid 0) has no tree to walk.
             let mut queue = std::collections::VecDeque::new();
             let mut seen = HashSet::new();
-            if t.pid != 0 {
+            // Only from the shell this tab started: the window's idea of its id can be
+            // a moment old, and by then Windows can have given that id to another
+            // program — whose children would otherwise be shown as this tab's.
+            if t.pid != 0 && ptys.shell_born(&t.pty, t.pid).is_none_or(|b| born.of(t.pid) == Some(b)) {
                 queue.push_back(t.pid);
                 seen.insert(t.pid);
             }
@@ -347,19 +511,12 @@ pub fn poll_status(
                         st.child_count += 1;
                     }
                     if st.cli.is_none() {
-                        if let Some(kind) = classify(&p.name) {
+                        if let Some(kind) = classify_proc(p) {
                             if kind == "claude" {
-                                // A launcher may wrap the real process: prefer the one
-                                // that owns a live-session file, but accept either.
-                                if let Some(s) = claude_session(p.pid) {
-                                    st.session_id = s.session_id;
-                                    st.session_name = s.name;
-                                    st.cli_status = s.status;
-                                    st.waiting_for = s.waiting_for.and_then(|w| w.as_str().map(|x| x.to_string()));
-                                    st.cli_cwd = s.cwd;
-                                    st.cli = Some(kind.into());
-                                    st.cli_pid = Some(p.pid);
-                                } else if st.cli_pid.is_none() {
+                                // A launcher may wrap the real process: the one that owns
+                                // a live-session file is preferred (settled below).
+                                claudes.push(p.pid);
+                                if st.cli_pid.is_none() {
                                     st.cli_pid = Some(p.pid);
                                 }
                             } else if st.cli_pid.is_none() {
@@ -375,7 +532,28 @@ pub fn poll_status(
                     queue.push_back(p.pid);
                 }
             }
-            // Claude is running but has not written its session file yet.
+            // Everything to measure: the tree just walked, plus the tab's job, which
+            // also holds processes whose parent has already exited.
+            let mut all = seen;
+            all.extend(ptys.job_pids(&t.pty));
+            all.retain(|pid| names.contains_key(pid));
+            // A CLI whose launcher has already exited is not under the shell any more,
+            // but it is still in the tab's job: found there (the oldest one, if several).
+            if st.cli_pid.is_none() {
+                let found = procs
+                    .iter()
+                    .filter(|p| p.pid != t.pid && all.contains(&p.pid))
+                    .filter_map(|p| classify_proc(p).map(|kind| (kind, p.pid, born.of(p.pid).unwrap_or(u64::MAX))))
+                    .min_by_key(|c| c.2);
+                if let Some((kind, pid, _)) = found {
+                    st.cli_pid = Some(pid);
+                    if kind == "claude" {
+                        claudes.push(pid);
+                    }
+                    st.cli = Some(kind.into());
+                }
+            }
+            // A Claude (its session file, if any, is read below).
             if st.cli.is_none() && st.cli_pid.is_some() {
                 st.cli = Some("claude".into());
             }
@@ -399,29 +577,58 @@ pub fn poll_status(
                     }
                 }
             }
-            // Everything to measure: the tree just walked, plus the tab's job, which
-            // also holds processes whose parent has already exited.
-            let mut all = seen;
-            all.extend(ptys.job_pids(&t.pty));
-            all.retain(|pid| names.contains_key(pid));
             // "Something is running in this tab" includes those parentless leftovers.
             st.child_count = all
                 .iter()
                 .filter(|pid| **pid != t.pid && !matches!(names.get(*pid).copied(), Some("conhost.exe") | Some("openconsole.exe")))
                 .count() as u32;
+            (st, all, claudes)
+        })
+        .collect();
+    let claude_pids: Vec<u32> = found.iter().flat_map(|f| f.2.iter().copied()).collect();
+    let mut facts = read_files(&app, claude_pids, wants);
+    let mut found: Vec<(TabStatus, HashSet<u32>)> = found
+        .into_iter()
+        .map(|(mut st, all, claudes)| {
+            if let Some((pid, s)) = claudes.iter().find_map(|p| facts.claude.get(p).cloned().flatten().map(|s| (*p, s))) {
+                if st.cli_pid != Some(pid) {
+                    st.cli_pid = Some(pid);
+                    st.cli_args = crate::usage::arguments(pid);
+                }
+                st.session_id = s.session_id;
+                st.session_name = s.name;
+                st.cli_status = s.status;
+                st.waiting_for = s.waiting_for.and_then(|w| w.as_str().map(|x| x.to_string()));
+                st.cli_cwd = s.cwd;
+            }
+            // (Only for a tab running Codex or Grok: a reading kept from an earlier look
+            // can name a tab whose CLI has changed since.)
+            if matches!(st.cli.as_deref(), Some("codex") | Some("grok")) {
+                if let Some(live) = facts.lives.remove(&st.id) {
+                    st.session_id = live.session_id;
+                    st.cli_status = live.status;
+                }
+            }
             (st, all)
         })
         .collect();
-    let mut lives = cache.resolve(&wants);
-    for (st, _) in found.iter_mut() {
-        if let Some(live) = lives.remove(&st.id) {
-            st.session_id = live.session_id;
-            st.cli_status = live.status;
+
+    let mut every: HashSet<u32> = found.iter().flat_map(|(_, pids)| pids.iter().copied()).collect();
+    // The WSL virtual machine (vmmem / vmmemWSL): Windows starts it, it is shared by
+    // every Linux distro and app, and no tab owns it — so it is shown on its own,
+    // beside the PC totals, and never ended by TermDeck.
+    let vm: Vec<u32> = procs.iter().filter(|p| p.name.starts_with("vmmem")).map(|p| p.pid).collect();
+    every.extend(vm.iter().copied());
+    let (readings, mut system) = usage.sample(&every);
+    if !vm.is_empty() {
+        system.wsl = true;
+        for pid in &vm {
+            if let Some(&(cpu, mem)) = readings.get(pid) {
+                system.wsl_cpu += cpu;
+                system.wsl_mem += mem;
+            }
         }
     }
-
-    let every: HashSet<u32> = found.iter().flat_map(|(_, pids)| pids.iter().copied()).collect();
-    let (readings, system) = usage.sample(&every);
     for (st, pids) in found.iter_mut() {
         for pid in pids.iter() {
             let Some(&(cpu, mem)) = readings.get(pid) else { continue };

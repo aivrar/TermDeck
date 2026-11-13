@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod clip;
+mod guard;
 mod picker;
 mod pty;
 mod sessions;
@@ -59,7 +60,40 @@ fn attention(window: tauri::WebviewWindow, on: bool) {
     }
 }
 
+/// When the window last said it has a close request (see `close_seen`).
+static CLOSE_SEEN: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// How long the window gets to answer a close request before it is taken for hung.
+const HUNG_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The window's close handler calls this first, before anything else it does.
+#[tauri::command]
+fn close_seen() {
+    *CLOSE_SEEN.lock().unwrap() = Some(std::time::Instant::now());
+}
+
+/// The window's X (or the taskbar's Close) was pressed. A working window answers at
+/// once — also while its question is on screen, or minimised — and takes it from there.
+/// A hung one cannot, and its X would do nothing; so when no answer has come after a
+/// few seconds, the app closes from here: tabs ended the usual way (the CLIs get their
+/// moment to quit), then out.
+fn watch_close_request(app: tauri::AppHandle) {
+    let asked = std::time::Instant::now();
+    std::thread::spawn(move || {
+        std::thread::sleep(HUNG_AFTER);
+        let answered = CLOSE_SEEN.lock().unwrap().is_some_and(|t| t >= asked);
+        if !answered {
+            let _ = app.state::<pty::PtyManager>().close_all(pty::CLOSE_GRACE);
+            app.exit(0);
+        }
+    });
+}
+
 fn main() {
+    // The hidden crash guard this app starts for itself (guard.rs) — nothing else.
+    if std::env::args().nth(1).as_deref() == Some(guard::ARG) {
+        guard::run();
+    }
     // Windows lets a process be started with "ignore Ctrl+C" set, and every program
     // it starts inherits that. If this app were launched that way (some launchers
     // and scripts do it), Ctrl+C would silently stop interrupting commands in every
@@ -69,6 +103,8 @@ fn main() {
     }
     // One copy per data folder: a second start brings the first to the front and ends.
     let Some(guard) = single::acquire() else { return };
+    // Before any tab exists, so the guard inherits nothing of theirs.
+    guard::start();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(pty::PtyManager::default())
@@ -182,6 +218,9 @@ fn main() {
                 if let Some(g) = *window.state::<GeometryState>().0.lock().unwrap() {
                     save_geometry(&g);
                 }
+                if matches!(event, WindowEvent::CloseRequested { .. }) {
+                    watch_close_request(window.app_handle().clone());
+                }
             }
             _ => {}
         })
@@ -205,6 +244,7 @@ fn main() {
             sessions::session_exists,
             picker::sessions_list,
             attention,
+            close_seen,
             store::store_load,
             store::store_save,
             store::store_keep,
@@ -223,7 +263,7 @@ fn main() {
             // this covers every other way out, so that leaving the app never leaves
             // programs running that nothing shows any more. Does nothing if all is closed.
             if let tauri::RunEvent::Exit = event {
-                app.state::<pty::PtyManager>().close_all(pty::CLOSE_GRACE);
+                let _ = app.state::<pty::PtyManager>().close_all(pty::CLOSE_GRACE);
             }
         });
 }

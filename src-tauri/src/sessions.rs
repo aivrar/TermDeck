@@ -7,7 +7,7 @@
 //!   Grok:  ~/.grok/sessions/<url-encoded cwd>/<id>/events.jsonl
 //!          turn_started ... permission_requested / permission_resolved ... turn_ended
 
-use crate::transcript::{codex_recent_files, home, mtime, norm, percent_decode};
+use crate::transcript::{codex_recent_files, mtime, norm, percent_decode};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -93,6 +93,7 @@ const SCAN_MAX_GAP: Duration = Duration::from_secs(30);
 #[derive(Default)]
 pub struct SessionCache(Mutex<Inner>);
 
+#[derive(Clone)]
 pub struct Live {
     pub session_id: Option<String>,
     /// "busy" | "idle" | "waiting"
@@ -146,7 +147,7 @@ fn sessions_by_folder(inner: &mut Inner, cli: &str, folders: &HashSet<String>) -
             }
         }
     } else {
-        let root = home().join(".grok").join("sessions");
+        let root = crate::transcript::cli_home("grok").join("sessions");
         for entry in fs::read_dir(root).into_iter().flatten().flatten() {
             let cwd = norm(&percent_decode(&entry.file_name().to_string_lossy()));
             if !folders.contains(&cwd) {
@@ -222,7 +223,7 @@ fn grok_active_from(text: &str) -> Option<HashMap<u32, (String, Option<SystemTim
 /// The folder of a Grok session, which exists from the moment Grok starts — before
 /// anything has been said (`locate` only knows sessions with a saved conversation).
 fn grok_dir(id: &str) -> Option<PathBuf> {
-    fs::read_dir(home().join(".grok").join("sessions")).ok()?.flatten().map(|e| e.path().join(id)).find(|p| p.is_dir())
+    fs::read_dir(crate::transcript::cli_home("grok").join("sessions")).ok()?.flatten().map(|e| e.path().join(id)).find(|p| p.is_dir())
 }
 
 /// Rule 0: where Grok itself says which of its processes is on which session, that is
@@ -484,7 +485,7 @@ pub fn locate(cli: &str, id: &str) -> Option<PathBuf> {
         return None;
     }
     match cli {
-        "claude" => fs::read_dir(home().join(".claude").join("projects"))
+        "claude" => fs::read_dir(crate::transcript::cli_home("claude").join("projects"))
             .ok()?
             .flatten()
             .map(|e| e.path().join(format!("{id}.jsonl")))
@@ -494,7 +495,7 @@ pub fn locate(cli: &str, id: &str) -> Option<PathBuf> {
         "codex" => codex_recent_files(usize::MAX)
             .into_iter()
             .find(|f| f.file_stem().is_some_and(|s| codex_id_of(&s.to_string_lossy()) == Some(id))),
-        "grok" => fs::read_dir(home().join(".grok").join("sessions"))
+        "grok" => fs::read_dir(crate::transcript::cli_home("grok").join("sessions"))
             .ok()?
             .flatten()
             .map(|e| e.path().join(id))
@@ -547,7 +548,7 @@ impl SessionCache {
         // What Grok says about its own sessions, on every look (one small file). A
         // read that fails or catches the file half-written changes nothing.
         if wants.iter().any(|w| w.cli == "grok") {
-            if let Some(list) = fs::read_to_string(home().join(".grok").join("active_sessions.json")).ok().and_then(|t| grok_active_from(&t)) {
+            if let Some(list) = fs::read_to_string(crate::transcript::cli_home("grok").join("active_sessions.json")).ok().and_then(|t| grok_active_from(&t)) {
                 inner.grok_active = list;
             }
             bind_grok_facts(&mut inner, wants, &grok_dir);

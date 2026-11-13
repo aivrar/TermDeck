@@ -43,7 +43,8 @@ $tests = @(
     @{ id = '18'; file = '18-medium.mjs';        args = @($work, $WslDistro) },
     @{ id = '19'; file = '19-panes.mjs';         args = @($work) },
     @{ id = '20'; file = '20-background-job.mjs'; args = @($work) },
-    @{ id = '21'; file = '21-audit2.mjs';        args = @($work) }
+    @{ id = '21'; file = '21-audit2.mjs';        args = @($work) },
+    @{ id = '22'; file = '22-process-control.mjs'; args = @($work, $WslDistro) }
 )
 
 $failed = @()

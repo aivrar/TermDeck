@@ -75,7 +75,8 @@ export function openHistory(paneBody: HTMLElement, tab: Tab, onClose: () => void
         const why = id
           ? `This tab's ${cli} conversation (${id}) has nothing saved yet, or its file is no longer there. ` +
             'Nothing else is shown in its place.'
-          : `No ${cli} session file was found for ${tab.state.cwd}.`;
+          : `This tab's ${cli} conversation has not been identified yet (nothing has been sent in it, or it was started in a way TermDeck cannot follow). ` +
+            'Other conversations in this folder are not shown in its place; they are listed under "Open…".';
         list.replaceChildren(h('div', { class: 'history-empty' }, why));
         more.replaceChildren();
         return;

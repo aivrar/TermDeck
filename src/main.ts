@@ -5,7 +5,7 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { listen } from '@tauri-apps/api/event';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { api, type CliKind, type CliVersion, type EnvInfo, type SessionInfo, type ShellKind, type SystemUsage, type UpdateResult } from './api';
-import { DEFAULT_SCROLLBACK, extractSwitches, flagValue, flagWords, FONT_STACK, fromMsysPath, mergeFlags, quoteArg, quotePath, shellFlags, Tab, toWslPath, THEME_LABEL, THEMES, type Look, type TabHost, type TabState, type ThemeName } from './tab';
+import { DEFAULT_SCROLLBACK, extractSwitches, flagValue, flagWords, FONT_STACK, fromMsysPath, mergeFlags, quoteArg, quotePath, shellFlags, survivorText, Tab, toWslPath, THEME_LABEL, THEMES, type Look, type TabHost, type TabState, type ThemeName } from './tab';
 import { Library, type Snippet } from './library';
 import { openHistory } from './history';
 import { baseName, confirmDialog, h, isModalOpen, menu, modal, toast, uid } from './ui';
@@ -221,6 +221,8 @@ class App implements TabHost {
   /** The state as it was last written to disk, to leave out writes that change nothing. */
   private savedText = '';
   private polling = false;
+  /** The look at the processes that has been asked for and has not come back yet. */
+  private pollInFlight: Promise<unknown> | null = null;
   /**
    * Set when the saved sessions could not be read AND could not be copied aside: nothing
    * is saved for the rest of this run, so the file on disk stays exactly as it is.
@@ -376,6 +378,9 @@ class App implements TabHost {
       toast('TermDeck was already open — this is it. (One copy runs per data folder, so sessions are never resumed twice.)', 'info', 5000);
     });
     void getCurrentWindow().onCloseRequested(async (event) => {
+      // First of all: tell the backend this window is alive and has the request. If it
+      // hears nothing, it takes the window for hung and closes the app itself.
+      void api.closeSeen().catch(() => {});
       // Closing the app ends everything its tabs started — so it asks first whenever
       // anything is running. (The emergency stop never asks; this is not that.)
       if (this.closeAsked) {
@@ -385,6 +390,23 @@ class App implements TabHost {
       this.closeAsked = true;
       await this.lookNow();
       this.closeAsked = false;
+      // A CLI update is not stopped halfway (that could break the CLI's install): it is
+      // left to finish by itself. But closing then means not seeing how it went — so
+      // that is asked first.
+      if (this.updating.size) {
+        this.closeAsked = true;
+        const names = [...this.updating].map((c) => CLI_NAME[c]).join(' and ');
+        const ok = await confirmDialog(
+          'An update is still running',
+          `${names} ${this.updating.size > 1 ? 'are' : 'is'} being updated. Closing TermDeck now does not stop the update halfway: it carries on hidden and finishes by itself, but TermDeck cannot show you how it went. To see the result, wait for it to finish.`,
+          'Close anyway',
+        );
+        this.closeAsked = false;
+        if (!ok) {
+          event.preventDefault();
+          return;
+        }
+      }
       const live = this.tabs.map((t) => ({ t, what: this.closingEnds(t) })).filter((x) => x.what);
       if (live.length) {
         this.closeAsked = true;
@@ -1294,24 +1316,31 @@ class App implements TabHost {
   }
 
   private async poll(): Promise<void> {
-    if (this.polling || this.closing) return;
+    // One look at a time — also after one was given up on below: while it has still
+    // not come back (a stalled disk, say), starting more would only pile them up.
+    if (this.polling || this.closing || this.pollInFlight) return;
     this.polling = true;
     try {
       // A tab whose shell has ended is still asked about (with no shell process):
       // something it started may be running on, and that should show up too.
       const tracked = this.tabs.filter((t) => t.procId);
-      // A look that never comes back must not stop all later ones — nor hold up closing
+      // A look that never comes back must not stop the window — nor hold up closing
       // the app, which waits for a fresh look. After 15 s it is given up on.
       let giveUp = 0;
+      const call = api.pollStatus(tracked.map((t) => ({
+        id: t.state.id,
+        pty: t.procId!,
+        pid: t.exited || t.pid === null ? 0 : t.pid,
+        cwd: t.state.cwd,
+        session: t.state.sessionId ?? null,
+        input: t.lastEnter || null,
+      })));
+      this.pollInFlight = call;
+      void call.catch(() => {}).finally(() => {
+        if (this.pollInFlight === call) this.pollInFlight = null;
+      });
       const res = await Promise.race([
-        api.pollStatus(tracked.map((t) => ({
-          id: t.state.id,
-          pty: t.procId!,
-          pid: t.exited || t.pid === null ? 0 : t.pid,
-          cwd: t.state.cwd,
-          session: t.state.sessionId ?? null,
-          input: t.lastEnter || null,
-        }))),
+        call,
         new Promise<never>((_, reject) => {
           giveUp = window.setTimeout(() => reject(new Error('the look at the processes did not come back')), 15000);
         }),
@@ -1421,7 +1450,13 @@ class App implements TabHost {
     const sys = this.system;
     const el = document.getElementById('sys-usage')!;
     if (sys && sys.memTotal) {
-      el.textContent = `PC  ·  CPU ${fmtCpu(sys.cpu)}  ·  RAM ${fmtMem(sys.memUsed)} / ${fmtMem(sys.memTotal)}`;
+      // The WSL virtual machine is one process shared by every Linux distro and app,
+      // so no tab can count it; it is shown here, as part of the PC, under its own name.
+      const vm = sys.wsl ? `  ·  WSL VM ${fmtCpu(sys.wslCpu)} · ${fmtMem(sys.wslMem)}` : '';
+      el.textContent = `PC  ·  CPU ${fmtCpu(sys.cpu)}  ·  RAM ${fmtMem(sys.memUsed)} / ${fmtMem(sys.memTotal)}${vm}`;
+      el.title = sys.wsl
+        ? 'The WSL VM runs every Linux distro (and Docker, if it uses WSL). It is shared, so its use is not counted in any tab — Linux programs a tab starts show up here. TermDeck never ends it; WSL stops it by itself once no distro is running.'
+        : '';
       el.className = `sb-sys ${sys.cpu >= 90 || sys.memUsed / sys.memTotal >= 0.9 ? 'hot' : ''}`;
     }
     this.procView?.();
@@ -1442,18 +1477,26 @@ class App implements TabHost {
   async killTab(tab: Tab): Promise<void> {
     const name = this.displayName(tab);
     const hadCli = tab.cliRunning !== 'none';
-    const n = await tab.killEverything();
-    toast(n
-      ? `Stopped ${n} process${n === 1 ? '' : 'es'} in "${name}".${hadCli ? ' The conversation can be resumed.' : ''}`
-      : `Nothing was running in "${name}".`);
+    const { targeted: n, survivors } = await tab.killEverything();
+    if (survivors.length) {
+      toast(`"${name}": ${survivorText(survivors)} could not be stopped — Windows refused (it may be running as administrator). End it from Task Manager.`, 'error', 12000);
+    } else {
+      toast(n
+        ? `Stopped ${n} process${n === 1 ? '' : 'es'} in "${name}".${hadCli ? ' The conversation can be resumed.' : ''}`
+        : `Nothing was running in "${name}".`);
+    }
     void this.poll();
   }
 
   async setLowPriority(tab: Tab, low: boolean): Promise<void> {
-    await tab.setLowPriority(low);
-    toast(low
-      ? `"${this.displayName(tab)}" now runs at low priority: it keeps working, on processor time nothing else wants.`
-      : `"${this.displayName(tab)}" is back at normal priority.`);
+    const ok = await tab.setLowPriority(low);
+    toast(!ok
+      ? low
+        ? `Could not lower the priority of "${this.displayName(tab)}" (Windows refused).`
+        : `"${this.displayName(tab)}" is back at normal priority as far as Windows allowed.`
+      : low
+        ? `"${this.displayName(tab)}" now runs at low priority: it keeps working, on processor time nothing else wants — and so does anything it starts from now on.`
+        : `"${this.displayName(tab)}" is back at normal priority.`, ok ? 'info' : 'error');
     this.renderUsage();
   }
 
@@ -1466,7 +1509,10 @@ class App implements TabHost {
     const rows = new Map<number, { root: HTMLDivElement; cpu: HTMLSpanElement; mem: HTMLSpanElement }>();
     const paint = () => {
       const cores = this.system?.cores ?? 0;
-      summary.textContent = `${tab.procs.length} process${tab.procs.length === 1 ? '' : 'es'}  ·  CPU ${fmtCpu(tab.cpu)} of the whole PC${cores ? ` (${cores} cores, so one busy core is ${fmtCpu(100 / cores)})` : ''}  ·  RAM ${fmtMem(tab.mem)}${tab.lowPriority ? '  ·  low priority' : ''}`;
+      // Linux programs this tab started (through wsl.exe) run inside the shared WSL VM.
+      const viaWsl = tab.state.shell === 'wsl' || tab.procs.some((p) => p.name === 'wsl.exe');
+      summary.textContent = `${tab.procs.length} process${tab.procs.length === 1 ? '' : 'es'}  ·  CPU ${fmtCpu(tab.cpu)} of the whole PC${cores ? ` (${cores} cores, so one busy core is ${fmtCpu(100 / cores)})` : ''}  ·  RAM ${fmtMem(tab.mem)}${tab.lowPriority ? '  ·  low priority' : ''}`
+        + (viaWsl ? `  ·  Linux work this tab started runs in the shared WSL VM, shown beside the PC totals (not counted here)` : '');
       const alive = new Set(tab.procs.map((p) => p.pid));
       for (const [pid, r] of rows) {
         if (!alive.has(pid)) {

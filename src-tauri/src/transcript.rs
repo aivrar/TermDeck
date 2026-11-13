@@ -5,7 +5,7 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -52,6 +52,21 @@ pub(crate) fn home() -> PathBuf {
     PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into()))
 }
 
+/// The folder a CLI keeps its files in: its own setting when one is set
+/// (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`), otherwise the usual one in the user folder.
+/// The CLIs in the tabs get the app's environment, so this is the folder they use.
+pub(crate) fn cli_home(cli: &str) -> PathBuf {
+    let (var, dir) = match cli {
+        "claude" => ("CLAUDE_CONFIG_DIR", ".claude"),
+        "codex" => ("CODEX_HOME", ".codex"),
+        _ => ("", ".grok"),
+    };
+    match std::env::var_os(var).filter(|v| !var.is_empty() && !v.is_empty()) {
+        Some(v) => PathBuf::from(v),
+        None => home().join(dir),
+    }
+}
+
 pub(crate) fn norm(p: &str) -> String {
     p.trim().trim_end_matches(['\\', '/']).replace('/', "\\").to_lowercase()
 }
@@ -62,7 +77,7 @@ pub(crate) fn mtime(p: &Path) -> SystemTime {
 
 /// Codex rollout files, newest date folder first, at most `limit`.
 pub(crate) fn codex_recent_files(limit: usize) -> Vec<PathBuf> {
-    let root = home().join(".codex").join("sessions");
+    let root = crate::transcript::cli_home("codex").join("sessions");
     // Folders are YYYY/MM/DD, so a reverse name sort walks newest first.
     let sorted_desc = |dir: &Path| -> Vec<PathBuf> {
         let mut v: Vec<PathBuf> =
@@ -105,69 +120,6 @@ pub(crate) fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-// ---------- locating the session file ----------
-
-// The newest conversation held in a folder — used only for a tab that has no
-// conversation of its own yet. A tab that has one is looked up by its id
-// (`sessions::locate`), and if that is not found nothing else is shown in its place.
-
-fn find_claude(cwd: &str) -> Option<PathBuf> {
-    let projects = home().join(".claude").join("projects");
-    let encoded: String = cwd
-        .trim_end_matches(['\\', '/'])
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let dir = projects.join(encoded);
-    fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-        .max_by_key(|p| mtime(p))
-}
-
-fn find_codex(cwd: &str) -> Option<PathBuf> {
-    let files = codex_recent_files(400);
-    let want = norm(cwd);
-    files
-        .into_iter()
-        .filter(|f| {
-            let Ok(file) = File::open(f) else { return false };
-            let mut first = String::new();
-            if BufReader::new(file).read_line(&mut first).is_err() {
-                return false;
-            }
-            serde_json::from_str::<Value>(&first)
-                .ok()
-                .and_then(|v| v["payload"]["cwd"].as_str().map(norm))
-                .is_some_and(|c| c == want)
-        })
-        .max_by_key(|f| mtime(f))
-}
-
-fn find_grok(cwd: &str) -> Option<PathBuf> {
-    let root = home().join(".grok").join("sessions");
-    let want = norm(cwd);
-    let mut best: Option<PathBuf> = None;
-    for entry in fs::read_dir(&root).ok()?.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if norm(&percent_decode(&name)) != want {
-            continue;
-        }
-        for s in fs::read_dir(entry.path()).ok()?.flatten() {
-            let chat = s.path().join("chat_history.jsonl");
-            if !chat.is_file() {
-                continue;
-            }
-            if best.as_ref().is_none_or(|b| mtime(&chat) > mtime(b)) {
-                best = Some(chat);
-            }
-        }
-    }
-    best
 }
 
 // ---------- bounded tail read ----------
@@ -379,16 +331,15 @@ pub fn transcript_load(
     if !matches!(cli.as_str(), "claude" | "codex" | "grok") {
         return Err(format!("no session reader for: {cli}"));
     }
-    let path = match session_id.as_deref().filter(|id| !id.trim().is_empty()) {
-        // This tab's own conversation, wherever it is — or nothing. (It used to fall
-        // back on the newest conversation in the folder, i.e. show a different one.)
-        Some(id) => crate::sessions::locate(&cli, id).map(|p| if cli == "grok" { p.join("chat_history.jsonl") } else { p }),
-        None => match cli.as_str() {
-            "claude" => find_claude(&cwd),
-            "codex" => find_codex(&cwd),
-            _ => find_grok(&cwd),
-        },
-    };
+    // This tab's own conversation, wherever it is — or nothing. (Without an id it used
+    // to show the newest conversation in the tab's folder, which can be another tab's
+    // or another window's.)
+    let _ = &cwd;
+    let path = session_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .and_then(|id| crate::sessions::locate(&cli, id))
+        .map(|p| if cli == "grok" { p.join("chat_history.jsonl") } else { p });
     let Some(path) = path else {
         return Ok(Transcript::default());
     };

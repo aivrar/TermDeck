@@ -82,13 +82,36 @@ struct TabProcs {
     /// The CLI running in the tab, what started it and what it started, as noted just
     /// before the CLI was asked to quit for an update (`pty_cli_note`).
     cli_noted: Vec<(u32, u64)>,
+    /// While the tab runs at low priority: what each of its processes had before
+    /// (id, creation time, priority class), so "back to normal" puts that back.
+    low: Option<Vec<(u32, u64, u32)>>,
 }
 
 impl TabProcs {
+    fn new(job: Option<Job>, older: Vec<Job>, shell_pid: u32, shell_born: u64) -> TabProcs {
+        TabProcs { job, older, shell_pid, shell_born, cli_noted: Vec::new(), low: None }
+    }
+
     /// The current shell's job and those of earlier shells.
     fn jobs(&self) -> impl Iterator<Item = &Job> {
         self.job.iter().chain(self.older.iter())
     }
+
+    /// Every job this tab has, the current one included — taken out, for a new shell
+    /// to carry on (any that Windows confirms empty are let go).
+    fn into_jobs(self) -> Vec<Job> {
+        self.job.into_iter().chain(self.older).filter(|job| !job.is_empty()).collect()
+    }
+}
+
+/// What an attempt to end processes left behind: programs that are still running
+/// (Windows refused, or they were started again meanwhile), by name.
+#[derive(Serialize, Default)]
+pub struct Ended {
+    /// How many processes were set to be ended.
+    pub targeted: u32,
+    /// Names of the ones still running afterwards.
+    pub survivors: Vec<String>,
 }
 
 #[derive(Default)]
@@ -102,10 +125,22 @@ impl PtyManager {
         self.sessions.lock().unwrap().get(id).cloned()
     }
 
-    /// The members of the tab's jobs (empty if it has none).
-    pub fn job_pids(&self, id: &str) -> Vec<u32> {
+    /// The creation time `pid` must have to be this tab's shell: None if the tab's shell
+    /// is not tracked (nothing to check against), Some(0) — which no process has — if
+    /// the tab's shell is a different process.
+    pub fn shell_born(&self, id: &str, pid: u32) -> Option<u64> {
         let procs = self.procs.lock().unwrap();
-        procs.get(id).map(|tp| tp.jobs().flat_map(|job| job.pids()).collect()).unwrap_or_default()
+        let tp = procs.get(id).filter(|tp| tp.shell_pid != 0 && tp.shell_born != 0)?;
+        Some(if tp.shell_pid == pid { tp.shell_born } else { 0 })
+    }
+
+    /// The members of the tab's jobs (empty if it has none). Jobs of earlier shells
+    /// that Windows confirms are now empty are let go here.
+    pub fn job_pids(&self, id: &str) -> Vec<u32> {
+        let mut procs = self.procs.lock().unwrap();
+        let Some(tp) = procs.get_mut(id) else { return Vec::new() };
+        tp.older.retain(|job| !job.is_empty());
+        tp.jobs().flat_map(|job| job.pids().unwrap_or_default()).collect()
     }
 
     /// Every process the tab is known to have started: the members of its job, plus
@@ -135,10 +170,6 @@ impl PtyManager {
         out
     }
 
-    /// The same, ids only.
-    pub fn tab_pids(&self, id: &str) -> HashSet<u32> {
-        self.tab_exact(id).into_iter().map(|p| p.0).collect()
-    }
 
     /// Closes tabs for good: the shell ends, the pseudo-terminal is closed, and every
     /// process the tab started is ended with it — including background programs that
@@ -147,12 +178,17 @@ impl PtyManager {
     /// Closing the pseudo-terminal is what tells console programs to finish (the same
     /// signal as closing a terminal window), so they get `grace` to do that by
     /// themselves; a CLI ended by force can count it as a crash. Whatever is still
-    /// running after that is ended by force. Returns how many that was.
-    pub fn close(&self, ids: &[String], grace: Duration) -> u32 {
+    /// running after that is ended by force (`targeted` is how many that was), and
+    /// what is running even after that is named in `survivors`.
+    pub fn close(&self, ids: &[String], grace: Duration) -> Ended {
         struct Closing {
             procs: Option<TabProcs>,
             listed: Vec<(u32, u64)>,
         }
+        // A Claude that has only just started first gets past its start (see
+        // status::settle_claudes): closing it in its first seconds would count against it.
+        let everything: Vec<u32> = ids.iter().flat_map(|id| self.tab_exact(id)).map(|p| p.0).collect();
+        crate::status::settle_claudes(&everything);
         let mut closing: Vec<Closing> = Vec::new();
         for id in ids {
             // Listed while the shell is still there to walk down from.
@@ -170,7 +206,7 @@ impl PtyManager {
         let left = |c: &Closing| -> HashSet<u32> {
             let mut pids: HashSet<u32> = c.listed.iter().filter(|(pid, born)| usage::alive_exact(*pid, *born)).map(|p| p.0).collect();
             if let Some(tp) = c.procs.as_ref() {
-                pids.extend(tp.jobs().flat_map(|job| job.pids()));
+                pids.extend(tp.jobs().flat_map(|job| job.pids().unwrap_or_default()));
             }
             pids
         };
@@ -192,15 +228,34 @@ impl PtyManager {
             for job in c.procs.iter().flat_map(|tp| tp.jobs()) {
                 job.terminate();
             }
+            // Listed again now, not only before the wait: a program outside the job
+            // (there should be none) can have started another meanwhile.
+            let mut again: Vec<(u32, u64)> = c.listed.clone();
             for (pid, born) in &c.listed {
+                for p in crate::status::tree_exact_of(*pid, *born) {
+                    if !again.contains(&p) {
+                        again.push(p);
+                    }
+                }
+            }
+            for (pid, born) in &again {
                 usage::kill_exact(*pid, *born);
             }
         }
-        forced
+        // Ending takes Windows a moment; then whatever still runs is named.
+        let began = std::time::Instant::now();
+        let mut rest: HashSet<u32> = closing.iter().flat_map(|c| left(c)).collect();
+        while !rest.is_empty() && began.elapsed() < Duration::from_millis(1500) {
+            std::thread::sleep(Duration::from_millis(100));
+            rest = closing.iter().flat_map(|c| left(c)).collect();
+        }
+        // (The jobs are let go as `closing` is dropped on return: that also ends
+        // anything that is somehow still in them.)
+        Ended { targeted: forced, survivors: crate::status::names_of(&rest) }
     }
 
     /// Closes every tab (see `close`).
-    pub fn close_all(&self, grace: Duration) -> u32 {
+    pub fn close_all(&self, grace: Duration) -> Ended {
         let mut ids: HashSet<String> = self.procs.lock().unwrap().keys().cloned().collect();
         ids.extend(self.sessions.lock().unwrap().keys().cloned());
         self.close(&ids.into_iter().collect::<Vec<_>>(), grace)
@@ -231,6 +286,9 @@ pub struct SpawnArgs {
 #[derive(Serialize)]
 pub struct SpawnInfo {
     pid: Option<u32>,
+    /// False if the shell could not be put in a job of its own: then what it starts is
+    /// followed only through the process tree, and the tab says so.
+    tracked: bool,
 }
 
 fn err<E: std::fmt::Display>(e: E) -> String {
@@ -396,7 +454,9 @@ pub fn pty_spawn(
     let mut older: Vec<Job> = Vec::new();
     if let Some(prev) = args.previous.as_deref().filter(|p| !p.is_empty() && *p != args.id) {
         if let Some(tp) = state.procs.lock().unwrap().remove(prev) {
-            older = tp.job.into_iter().chain(tp.older).filter(|job| !job.pids().is_empty()).collect();
+            // Every job kept unless Windows confirms it is empty: a job let go ends
+            // what is in it, and one Windows could not be asked about may hold programs.
+            older = tp.into_jobs();
         }
         let session = state.sessions.lock().unwrap().remove(prev);
         if let Some(s) = session {
@@ -408,7 +468,7 @@ pub fn pty_spawn(
         // No new shell took them over (it could not be started): kept under the new id
         // all the same, where the tab looks for what it has running.
         let mut procs = state.procs.lock().unwrap();
-        let tp = procs.entry(args.id.clone()).or_insert(TabProcs { job: None, older: Vec::new(), shell_pid: 0, shell_born: 0, cli_noted: Vec::new() });
+        let tp = procs.entry(args.id.clone()).or_insert_with(|| TabProcs::new(None, Vec::new(), 0, 0));
         tp.older.extend(older);
     }
     result
@@ -428,20 +488,59 @@ fn spawn_shell(state: &PtyManager, args: &SpawnArgs, on_event: Channel<PtyEvent>
     drop(pair.slave);
 
     let pid = child.process_id();
+    let mut tracked = false;
     if let Some(p) = pid {
-        // Straight into its own job, before it has had time to start anything.
-        let tracked = TabProcs {
-            job: Job::for_process(p),
-            older: std::mem::take(older),
-            shell_pid: p,
-            shell_born: usage::created(p).unwrap_or(0),
-            cli_noted: Vec::new(),
-        };
-        state.procs.lock().unwrap().insert(args.id.clone(), tracked);
+        // Straight into its own job, before it has had time to start anything. A
+        // shell can still be quicker than that (a profile script that starts a
+        // program at once): whatever it has started by then is put in the job too.
+        let born = usage::created(p).unwrap_or(0);
+        let job = Job::for_process(p, usage::OnClose::End);
+        if let Some(job) = &job {
+            for (child_pid, _) in crate::status::tree_exact_of(p, born) {
+                if child_pid != p {
+                    job.adopt(child_pid);
+                }
+            }
+        }
+        tracked = job.is_some();
+        let mut entry = TabProcs::new(job, std::mem::take(older), p, born);
+        let mut procs = state.procs.lock().unwrap();
+        // A tab id that is somehow still tracked keeps its jobs (letting one go would
+        // end what is in it): they are carried over like an earlier shell's.
+        if let Some(prev) = procs.remove(&args.id) {
+            entry.older.extend(prev.into_jobs());
+        }
+        procs.insert(args.id.clone(), entry);
     }
     let killer = child.clone_killer();
-    let mut reader = pair.master.try_clone_reader().map_err(err)?;
-    let mut writer: Box<dyn Write + Send> = pair.master.take_writer().map_err(err)?;
+    // If the terminal cannot be wired up after all, the shell that was just started is
+    // ended and no longer tracked, instead of running on with nothing to show it.
+    let mut undo = |state: &PtyManager, mut child: Box<dyn portable_pty::Child + Send + Sync>| {
+        let _ = child.kill();
+        if let Some(tp) = state.procs.lock().unwrap().remove(&args.id) {
+            if let Some(job) = &tp.job {
+                job.terminate();
+            }
+            // Earlier shells' jobs stay the tab's.
+            if !tp.older.is_empty() {
+                older.extend(tp.older);
+            }
+        }
+    };
+    let mut reader = match pair.master.try_clone_reader() {
+        Ok(r) => r,
+        Err(e) => {
+            undo(state, child);
+            return Err(err(e));
+        }
+    };
+    let mut writer: Box<dyn Write + Send> = match pair.master.take_writer() {
+        Ok(w) => w,
+        Err(e) => {
+            undo(state, child);
+            return Err(err(e));
+        }
+    };
     let flow = Arc::new(Flow::default());
     let (input, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let queued = Arc::new(AtomicUsize::new(0));
@@ -481,6 +580,11 @@ fn spawn_shell(state: &PtyManager, args: &SpawnArgs, on_event: Channel<PtyEvent>
                     while st.buf.len() > READ_BUFFER_CAP && !st.eof {
                         st = rflow.cv.wait_timeout(st, Duration::from_millis(500)).unwrap().0;
                     }
+                    // The tab has ended and nothing is sending any more: something that
+                    // still holds the terminal open must not fill memory without end.
+                    if st.eof && st.buf.len() > READ_BUFFER_CAP {
+                        break;
+                    }
                     st.buf.extend_from_slice(&chunk[..n]);
                     rflow.cv.notify_all();
                 }
@@ -516,7 +620,10 @@ fn spawn_shell(state: &PtyManager, args: &SpawnArgs, on_event: Channel<PtyEvent>
                     waited += 1;
                 }
                 if waited >= 20 {
-                    st.unacked = 0;
+                    // Five seconds without a word from the window: one more chunk goes,
+                    // then it waits again. A lost acknowledgement cannot freeze the tab,
+                    // and a window that has hung is not sent output at full speed.
+                    st.unacked = HIGH_WATER;
                 }
                 let take = st.buf.len().min(MAX_CHUNK);
                 pending.extend(st.buf.drain(..take));
@@ -552,17 +659,19 @@ fn spawn_shell(state: &PtyManager, args: &SpawnArgs, on_event: Channel<PtyEvent>
         let _ = on_event.send(PtyEvent::Exit { code });
     });
 
-    Ok(SpawnInfo { pid })
+    Ok(SpawnInfo { pid, tracked })
 }
 
 #[tauri::command]
 pub fn pty_write(state: State<'_, PtyManager>, id: String, data: String) -> Result<(), String> {
     let s = state.session(&id).ok_or("terminal is closed")?;
-    if s.queued.load(Ordering::Relaxed) > INPUT_CAP {
+    let bytes = data.into_bytes();
+    // Reserved before it is queued, counting what is being added: a single huge paste,
+    // or several at once, cannot take the queue past the cap.
+    let n = bytes.len();
+    if s.queued.fetch_update(Ordering::AcqRel, Ordering::Acquire, |q| (q + n <= INPUT_CAP).then_some(q + n)).is_err() {
         return Err("input not passed on: the program in this tab has stopped reading its input".into());
     }
-    let bytes = data.into_bytes();
-    s.queued.fetch_add(bytes.len(), Ordering::Relaxed);
     let sent = s.input.lock().unwrap().send(bytes);
     sent.map_err(err)
 }
@@ -589,24 +698,42 @@ pub fn pty_ack(state: State<'_, PtyManager>, id: String, n: usize) {
 }
 
 /// Closes tabs for good, ending everything they started (see `PtyManager::close`).
-/// Returns how many processes had to be ended by force.
+/// Says how many processes had to be ended by force, and names any still running.
 #[tauri::command(async)]
-pub fn pty_close(state: State<'_, PtyManager>, ids: Vec<String>) -> u32 {
+pub fn pty_close(state: State<'_, PtyManager>, ids: Vec<String>) -> Ended {
     state.close(&ids, CLOSE_GRACE)
 }
 
 /// Closes every tab, ending everything they started: when the app closes, and when
 /// its page starts (which finds something only if the page was reloaded).
 #[tauri::command(async)]
-pub fn pty_kill_all(state: State<'_, PtyManager>) -> u32 {
+pub fn pty_kill_all(state: State<'_, PtyManager>) -> Ended {
     state.close_all(CLOSE_GRACE)
 }
 
+/// Waits a moment for listed processes to be gone — ending takes Windows an instant —
+/// and names those still running, with anything left in the tab's jobs.
+fn still_running(state: &PtyManager, id: &str, listed: &[(u32, u64)]) -> Vec<String> {
+    let left = || -> HashSet<u32> {
+        let mut pids: HashSet<u32> = listed.iter().filter(|(pid, born)| usage::alive_exact(*pid, *born)).map(|p| p.0).collect();
+        pids.extend(state.job_pids(id));
+        pids
+    };
+    let began = std::time::Instant::now();
+    let mut rest = left();
+    while !rest.is_empty() && began.elapsed() < Duration::from_millis(1500) {
+        std::thread::sleep(Duration::from_millis(100));
+        rest = left();
+    }
+    crate::status::names_of(&rest)
+}
+
 /// Emergency stop: ends every process the tab has started, the shell included.
-/// Returns how many processes were targeted. The shell's exit is then reported to
-/// the window the usual way.
+/// Says how many processes were targeted and names any still running afterwards
+/// (Windows refused — e.g. a program running as administrator). The shell's exit is
+/// then reported to the window the usual way.
 #[tauri::command(async)]
-pub fn pty_kill_tree(state: State<'_, PtyManager>, id: String) -> u32 {
+pub fn pty_kill_tree(state: State<'_, PtyManager>, id: String) -> Ended {
     let listed = state.tab_exact(&id);
     // The job goes first: one call, and nothing in it can start a replacement.
     if let Some(tp) = state.procs.lock().unwrap().get(&id) {
@@ -617,7 +744,7 @@ pub fn pty_kill_tree(state: State<'_, PtyManager>, id: String) -> u32 {
     for (pid, born) in &listed {
         usage::kill_exact(*pid, *born);
     }
-    listed.len() as u32
+    Ended { targeted: listed.len() as u32, survivors: still_running(&state, &id, &listed) }
 }
 
 /// Ends one process, if it belongs to the tab.
@@ -626,10 +753,38 @@ pub fn proc_kill(state: State<'_, PtyManager>, id: String, pid: u32) -> bool {
     state.tab_exact(&id).iter().any(|p| p.0 == pid && usage::kill_exact(p.0, p.1))
 }
 
-/// Low priority on or off for everything in the tab. Returns how many were changed.
+/// Low priority on or off for everything in the tab — on, it also holds for whatever
+/// the tab starts later (it is set on the tab's job); off, each process gets back the
+/// priority it had before. Returns how many processes were changed.
 #[tauri::command(async)]
 pub fn tab_priority(state: State<'_, PtyManager>, id: String, low: bool) -> u32 {
-    state.tab_pids(&id).iter().filter(|pid| usage::set_low_priority(**pid, low)).count() as u32
+    use windows_sys::Win32::System::Threading::{IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS};
+    let listed = state.tab_exact(&id);
+    let mut procs = state.procs.lock().unwrap();
+    let Some(tp) = procs.get_mut(&id) else { return 0 };
+    if low {
+        if tp.low.is_none() {
+            tp.low = Some(listed.iter().filter_map(|(pid, born)| usage::priority_of(*pid).map(|c| (*pid, *born, c))).collect());
+        }
+        for job in tp.jobs() {
+            job.set_low_priority(true);
+        }
+        // Set one by one as well: that covers anything not in a job, and is what says
+        // whether it took.
+        listed.iter().filter(|(pid, born)| usage::set_priority_exact(*pid, Some(*born), IDLE_PRIORITY_CLASS)).count() as u32
+    } else {
+        for job in tp.jobs() {
+            job.set_low_priority(false);
+        }
+        let before = tp.low.take().unwrap_or_default();
+        listed
+            .iter()
+            .filter(|(pid, born)| {
+                let class = before.iter().find(|b| b.0 == *pid && b.1 == *born).map(|b| b.2).unwrap_or(NORMAL_PRIORITY_CLASS);
+                usage::set_priority_exact(*pid, Some(*born), class)
+            })
+            .count() as u32
+    }
 }
 
 /// "Close for update", step one — before the CLI is asked to quit: notes the CLI's
@@ -662,6 +817,9 @@ pub fn pty_cli_note(state: State<'_, PtyManager>, id: String, cli: u32) -> u32 {
     if let Some(tp) = state.procs.lock().unwrap().get_mut(&id) {
         tp.cli_noted = noted;
     }
+    // It is asked to quit next: a Claude that has only just started first gets past its
+    // start (see status::settle_claudes).
+    crate::status::settle_claudes(&[cli]);
     count
 }
 
@@ -701,7 +859,7 @@ pub fn pty_cli_end(state: State<'_, PtyManager>, id: String) -> u32 {
 /// Ends what is running in the tab but keeps its shell at the prompt. With `spare`
 /// (the CLI's process id) the CLI itself and the launcher chain above it are left
 /// alone too, so only what the CLI started is ended — the CLI is then asked to quit
-/// the normal way. Returns how many processes were ended.
+/// the normal way. Returns how many processes were actually ended.
 #[tauri::command(async)]
 pub fn pty_kill_children(state: State<'_, PtyManager>, id: String, spare: Option<u32>) -> u32 {
     let shell = state.procs.lock().unwrap().get(&id).map(|tp| tp.shell_pid);
@@ -715,8 +873,11 @@ pub fn pty_kill_children(state: State<'_, PtyManager>, id: String, spare: Option
             listed.retain(|p| !keep.contains(&p.0));
         }
     }
-    for (pid, born) in &listed {
-        usage::kill_exact(*pid, *born);
+    let ended = listed.iter().filter(|(pid, born)| usage::kill_exact(*pid, *born)).count() as u32;
+    // The CLI is asked to quit next: a Claude that has only just started first gets past
+    // its start (see status::settle_claudes). What it started is ended already.
+    if let Some(cli) = spare {
+        crate::status::settle_claudes(&[cli]);
     }
-    listed.len() as u32
+    ended
 }

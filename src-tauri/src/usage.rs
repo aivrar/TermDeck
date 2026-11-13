@@ -6,6 +6,14 @@
 //! when its parent exits — which is exactly the case a walk of the process tree
 //! misses (a build tool that starts workers and then quits, leaving them running).
 //!
+//! Nothing may leave a tab's job. (It used to be allowed, "so nothing fails to start";
+//! but Git Bash — which Claude Code runs every command through — then starts every
+//! Windows program outside the job, and its own processes routinely exit mid-chain, so
+//! what Claude ran was counted in no tab and outlived Kill and close. Measured
+//! 2026-11-12.) And if TermDeck itself ends unexpectedly — a crash, Task Manager's End
+//! task — the crash guard (guard.rs) ends every tab's programs instead of leaving them
+//! running where nothing can see or stop them any more.
+//!
 //! None of this needs administrator rights: these are the app's own child processes.
 
 use serde::Serialize;
@@ -13,19 +21,19 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::time::Instant;
-use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_MORE_DATA, FILETIME, HANDLE, WAIT_TIMEOUT};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_PROCESS_ID_LIST,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_PRIORITY_CLASS,
 };
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::SystemInformation::{
     GetSystemInfo, GetSystemTimeAsFileTime, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessTimes, GetSystemTimes, OpenProcess, SetPriorityClass, TerminateProcess,
-    WaitForSingleObject, ABOVE_NORMAL_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
+    GetCurrentProcess, GetPriorityClass, GetProcessTimes, GetSystemTimes, OpenProcess, SetPriorityClass, TerminateProcess,
+    WaitForSingleObject, ABOVE_NORMAL_PRIORITY_CLASS, IDLE_PRIORITY_CLASS,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA, PROCESS_SYNCHRONIZE,
     PROCESS_TERMINATE,
 };
@@ -37,61 +45,136 @@ fn ticks(ft: &FILETIME) -> u64 {
 // ---------- job objects ----------
 
 /// A Job Object holding one tab's shell and everything started under it.
-pub struct Job(HANDLE);
+pub struct Job {
+    handle: HANDLE,
+    /// The limits it was made with, so that low priority can be added and taken off
+    /// again without losing them.
+    flags: u32,
+    /// Its programs end with it (OnClose::End): when it is let go of, and — through the
+    /// crash guard — when TermDeck ends unexpectedly.
+    ends: bool,
+}
 // A job handle is a plain kernel handle; it is safe to use from any thread.
 unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
 
+/// How a job treats its processes when its last handle is closed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OnClose {
+    /// Everything still in it is ended (tabs, and the app's own short-lived helpers).
+    End,
+    /// Left running (a CLI updater: stopping one halfway could break the CLI's install).
+    Keep,
+}
+
 impl Job {
-    /// Creates a job and puts the given (just started) process in it.
-    pub fn for_process(pid: u32) -> Option<Job> {
+    /// Creates a job and puts the given (just started) process in it. Nothing in the
+    /// job may leave it (no breakaway is allowed).
+    pub fn for_process(pid: u32, on_close: OnClose) -> Option<Job> {
         unsafe {
-            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if job.is_null() {
+            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle.is_null() {
                 return None;
             }
-            // Programs that ask to leave the job (some updaters and launchers do)
-            // are allowed to, so being in a job never makes anything fail to start.
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
-            SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as *const c_void,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            );
+            // No limits at all: in particular not Windows' "end everything when the last
+            // handle closes" — see guard.rs for why the crash guard does that instead.
+            let job = Job { handle, flags: 0, ends: on_close == OnClose::End };
+            if !job.set_flags(job.flags, 0) {
+                return None;
+            }
+            if job.ends {
+                // Without the guard the tab still works and is still ended on every
+                // normal close; only a crash of TermDeck would leave its programs.
+                crate::guard::watch(job.handle);
+            }
             let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
             if process.is_null() {
-                CloseHandle(job);
                 return None;
             }
-            let ok = AssignProcessToJobObject(job, process);
+            let ok = AssignProcessToJobObject(job.handle, process);
             CloseHandle(process);
             if ok == 0 {
-                CloseHandle(job);
                 return None;
             }
-            Some(Job(job))
+            Some(job)
         }
     }
 
-    /// Every process currently in the job.
-    pub fn pids(&self) -> Vec<u32> {
-        const ROOM: usize = 2048;
-        // u64 storage keeps the buffer aligned for the structure laid over it.
-        let mut buf = vec![0u64; ROOM + 2];
+    /// Adds a process to the job (one that was started before its parent was put in
+    /// it). False if it could not be.
+    pub fn adopt(&self, pid: u32) -> bool {
         unsafe {
-            QueryInformationJobObject(
-                self.0,
-                JobObjectBasicProcessIdList,
-                buf.as_mut_ptr() as *mut c_void,
-                (buf.len() * 8) as u32,
-                std::ptr::null_mut(),
-            );
-            let list = buf.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST;
-            let n = ((*list).NumberOfProcessIdsInList as usize).min(ROOM);
-            std::slice::from_raw_parts((*list).ProcessIdList.as_ptr(), n).iter().map(|p| *p as u32).collect()
+            let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if process.is_null() {
+                return false;
+            }
+            let ok = AssignProcessToJobObject(self.handle, process) != 0;
+            CloseHandle(process);
+            ok
         }
+    }
+
+    fn set_flags(&self, flags: u32, priority: u32) -> bool {
+        unsafe {
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = flags;
+            info.BasicLimitInformation.PriorityClass = priority;
+            SetInformationJobObject(
+                self.handle,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) != 0
+        }
+    }
+
+    /// Low priority for everything in the job — what runs now and anything started in
+    /// it later — or the limit taken off again. (Taking it off does not change the
+    /// processes back by themselves; whoever set it puts back what each had before.)
+    /// True if Windows took it.
+    pub fn set_low_priority(&self, low: bool) -> bool {
+        if low {
+            self.set_flags(self.flags | JOB_OBJECT_LIMIT_PRIORITY_CLASS, IDLE_PRIORITY_CLASS)
+        } else {
+            self.set_flags(self.flags, 0)
+        }
+    }
+
+    /// Every process currently in the job — or None if Windows would not say (then
+    /// nothing may be concluded, least of all that the job is empty).
+    pub fn pids(&self) -> Option<Vec<u32>> {
+        // Room grows to what Windows reports, up to far more than any tab will hold.
+        let mut room: usize = 512;
+        loop {
+            // u64 storage keeps the buffer aligned for the structure laid over it:
+            // two counts (one u64), then one u64-sized id per process.
+            let mut buf = vec![0u64; room + 1];
+            unsafe {
+                let ok = QueryInformationJobObject(
+                    self.handle,
+                    JobObjectBasicProcessIdList,
+                    buf.as_mut_ptr() as *mut c_void,
+                    (buf.len() * 8) as u32,
+                    std::ptr::null_mut(),
+                ) != 0;
+                let list = buf.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST;
+                let assigned = (*list).NumberOfAssignedProcesses as usize;
+                if ok {
+                    let n = ((*list).NumberOfProcessIdsInList as usize).min(room);
+                    return Some(std::slice::from_raw_parts((*list).ProcessIdList.as_ptr(), n).iter().map(|p| *p as u32).collect());
+                }
+                if GetLastError() == ERROR_MORE_DATA && room < 65_536 {
+                    room = (assigned + 64).max(room * 2).min(65_536);
+                    continue;
+                }
+                return None;
+            }
+        }
+    }
+
+    /// True only when Windows confirms the job holds nothing.
+    pub fn is_empty(&self) -> bool {
+        self.pids().is_some_and(|p| p.is_empty())
     }
 
     /// Every process currently in the job, each with its creation time. Membership is
@@ -101,14 +184,14 @@ impl Job {
     /// not in this job, and is left out here instead of being taken for the tab's.
     pub fn members_exact(&self) -> Vec<(u32, u64)> {
         let mut out = Vec::new();
-        for pid in self.pids() {
+        for pid in self.pids().unwrap_or_default() {
             unsafe {
                 let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
                 if handle.is_null() {
                     continue;
                 }
                 let mut inside = 0;
-                let member = IsProcessInJob(handle, self.0, &mut inside) != 0 && inside != 0;
+                let member = IsProcessInJob(handle, self.handle, &mut inside) != 0 && inside != 0;
                 let mut created: FILETIME = std::mem::zeroed();
                 let mut other: [FILETIME; 3] = std::mem::zeroed();
                 let timed = member && GetProcessTimes(handle, &mut created, &mut other[0], &mut other[1], &mut other[2]) != 0;
@@ -121,19 +204,24 @@ impl Job {
         out
     }
 
-    /// Ends every process in the job at once.
-    pub fn terminate(&self) {
-        unsafe {
-            TerminateJobObject(self.0, 1);
-        }
+    /// Ends every process in the job at once. False if Windows refused.
+    pub fn terminate(&self) -> bool {
+        unsafe { TerminateJobObject(self.handle, 1) != 0 }
     }
 }
 
 impl Drop for Job {
     fn drop(&mut self) {
-        // Closing the handle does not end the processes; the job just stops being tracked.
+        // A job whose programs end with it (OnClose::End) ends whatever is still in it.
+        // Every place that lets go of a tab's job has ended its programs already or has
+        // confirmed the job is empty; for the app's short-lived helpers this ends what
+        // a helper left running.
         unsafe {
-            CloseHandle(self.0);
+            if self.ends {
+                TerminateJobObject(self.handle, 1);
+                crate::guard::release(self.handle);
+            }
+            CloseHandle(self.handle);
         }
     }
 }
@@ -208,16 +296,35 @@ pub fn kill_exact(pid: u32, born: u64) -> bool {
     }
 }
 
-/// Low = only gets CPU nothing else wants. Processes it starts later inherit that.
-pub fn set_low_priority(pid: u32, low: bool) -> bool {
+/// A process's priority class, if it can be read.
+pub fn priority_of(pid: u32) -> Option<u32> {
     unsafe {
-        let handle = OpenProcess(PROCESS_SET_INFORMATION, 0, pid);
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let class = GetPriorityClass(handle);
+        CloseHandle(handle);
+        (class != 0).then_some(class)
+    }
+}
+
+/// Sets a process's priority class — with `born`, only if the id still means the
+/// process created then. False if it could not be done.
+pub fn set_priority_exact(pid: u32, born: Option<u64>, class: u32) -> bool {
+    unsafe {
+        let handle = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
             return false;
         }
-        let ok = SetPriorityClass(handle, if low { IDLE_PRIORITY_CLASS } else { NORMAL_PRIORITY_CLASS });
+        let mut created: FILETIME = std::mem::zeroed();
+        let mut other: [FILETIME; 3] = std::mem::zeroed();
+        let same = born.is_none_or(|b| {
+            GetProcessTimes(handle, &mut created, &mut other[0], &mut other[1], &mut other[2]) != 0 && ticks(&created) == b
+        });
+        let ok = same && SetPriorityClass(handle, class) != 0;
         CloseHandle(handle);
-        ok != 0
+        ok
     }
 }
 
@@ -259,6 +366,11 @@ pub struct SystemUsage {
     pub mem_used: u64,
     pub mem_total: u64,
     pub cores: u32,
+    /// The WSL virtual machine is running (it is shared, so no tab counts it).
+    pub wsl: bool,
+    /// Its CPU (percent of the whole PC) and memory in use (bytes).
+    pub wsl_cpu: f32,
+    pub wsl_mem: u64,
 }
 
 #[derive(Default)]
@@ -431,4 +543,62 @@ fn split_args(line: &str) -> Vec<String> {
         args.push(cur);
     }
     args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    /// Process ids of running `ping.exe` whose command line carries `marker`.
+    fn pings(marker: &str) -> Vec<u32> {
+        let out = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", &format!("Get-CimInstance Win32_Process -Filter \"Name='PING.EXE'\" | ? {{ $_.CommandLine -match '-n {marker} ' }} | % {{ $_.ProcessId }}")])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect()
+    }
+
+    /// Git Bash starts Windows programs outside the job whenever the job lets it, and
+    /// its starter exits at once here — the way Claude Code's background commands run.
+    /// In a tab's job the program must stay in, and must end when the job is let go
+    /// (which is also what happens when TermDeck itself ends unexpectedly).
+    #[test]
+    fn a_program_started_from_git_bash_stays_in_the_job_and_ends_with_it() {
+        let bash = r"C:\Program Files\Git\usr\bin\bash.exe";
+        if !std::path::Path::new(bash).is_file() {
+            eprintln!("Git Bash is not installed: skipped");
+            return;
+        }
+        let marker = "4711";
+        // bash waits a moment before it starts anything, so it is in the job by then;
+        // then ping goes into the background and bash exits.
+        let script = format!("sleep 1; (ping -n {marker} 127.0.0.1 >/dev/null &)");
+        let mut child = Command::new(bash).args(["-c", &script]).stdout(Stdio::null()).creation_flags(0x0800_0000).spawn().unwrap();
+        let job = Job::for_process(child.id(), OnClose::End).expect("a job");
+        std::thread::sleep(Duration::from_millis(3500));
+        let found = pings(marker);
+        assert_eq!(found.len(), 1, "the background program did not start");
+        assert!(job.pids().unwrap().contains(&found[0]), "the program left the job");
+        drop(job);
+        std::thread::sleep(Duration::from_millis(800));
+        let left = pings(marker);
+        for pid in &left {
+            let _ = Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
+        }
+        assert!(left.is_empty(), "the program outlived its job");
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn an_unknown_job_is_never_taken_for_an_empty_one() {
+        // A handle that is not a job: Windows cannot list it, and that must not read as "empty".
+        // (Not null: to Windows that means "the job this process is in".)
+        let bogus = Job { handle: unsafe { GetCurrentProcess() }, flags: 0, ends: false };
+        assert!(bogus.pids().is_none());
+        assert!(!bogus.is_empty());
+        std::mem::forget(bogus);
+    }
 }

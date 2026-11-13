@@ -3,7 +3,7 @@
 //! Only the start of each file is read, and only for the newest files, so a large
 //! history costs little.
 
-use crate::transcript::{codex_recent_files, home, mtime, norm, percent_decode};
+use crate::transcript::{codex_recent_files, mtime, norm, percent_decode};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs::{self, File};
@@ -161,7 +161,7 @@ pub fn sessions_list(cli: String, cwd: Option<String>, limit: Option<usize>) -> 
     let mut out: Vec<SessionInfo> = Vec::new();
     match cli.as_str() {
         "claude" => {
-            let projects = home().join(".claude").join("projects");
+            let projects = crate::transcript::cli_home("claude").join("projects");
             let dirs: Vec<PathBuf> = match &want {
                 // Claude names the folder after the path, every other character as "-".
                 Some(_) => {
@@ -220,7 +220,7 @@ pub fn sessions_list(cli: String, cwd: Option<String>, limit: Option<usize>) -> 
             }
         }
         "grok" => {
-            let root = home().join(".grok").join("sessions");
+            let root = crate::transcript::cli_home("grok").join("sessions");
             let mut files = Vec::new();
             for entry in fs::read_dir(&root).into_iter().flatten().flatten() {
                 let dir = percent_decode(&entry.file_name().to_string_lossy());

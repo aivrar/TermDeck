@@ -18,6 +18,12 @@ interface AppState {
   activePane: number;
   sidebarWidth: number;
   libraryWidth: number;
+  /**
+   * How the pane area is shared out, as set by dragging the dividers between panes:
+   * one weight per pane, kept apart for side by side and stacked. Missing, or not one
+   * per pane, means equal shares.
+   */
+  paneSizes?: { side?: number[]; stack?: number[] };
   libraryOpen: boolean;
   fontSize: number;
   recentDirs: string[];
@@ -53,6 +59,9 @@ interface Settings {
    */
   paneLayout: 'auto' | 'side' | 'stack';
 }
+
+const DEFAULT_SIDEBAR_WIDTH = 230;
+const DEFAULT_LIBRARY_WIDTH = 280;
 
 const DEFAULT_SETTINGS: Settings = {
   fontFamily: '',
@@ -202,8 +211,8 @@ class App implements TabHost {
     tabs: [],
     panes: [null],
     activePane: 0,
-    sidebarWidth: 230,
-    libraryWidth: 280,
+    sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
+    libraryWidth: DEFAULT_LIBRARY_WIDTH,
     libraryOpen: true,
     fontSize: DEFAULT_FONT,
     recentDirs: [],
@@ -265,6 +274,11 @@ class App implements TabHost {
   private readonly parking = document.getElementById('parking')!;
   /** True while the panes are one above the other instead of side by side. */
   stacked = false;
+  /** The grid tracks last set on the pane area (to set them only when they change). */
+  private gridColumns = '';
+  private gridRows = '';
+  /** The draggable lines between panes (one fewer than there are panes). */
+  private dividers: HTMLElement[] = [];
   /** Watches the area the panes share: when its shape changes, so may their arrangement. */
   private readonly panesObserver = new ResizeObserver(() => this.applyPaneDirection());
   private readonly resizeObserver = new ResizeObserver((entries) => {
@@ -287,6 +301,8 @@ class App implements TabHost {
       const saved = await api.storeLoad<AppState>('state');
       if (saved && saved.version === 1 && Array.isArray(saved.tabs)) {
         this.state = { ...this.state, ...saved };
+        const sizes = this.state.paneSizes as unknown;
+        if (sizes !== undefined && (typeof sizes !== 'object' || sizes === null || Array.isArray(sizes))) delete this.state.paneSizes;
         hadSaved = true;
       }
       else if (saved) throw new Error('state.json is not in a form this version understands');
@@ -674,9 +690,11 @@ class App implements TabHost {
     }
     for (const t of this.tabs) this.parking.append(t.el);
     this.panesEl.replaceChildren();
+    this.dividers = [];
     this.applyPaneDirection();
     this.panesObserver.observe(this.panesEl); // (observing twice is the same as once)
     this.panes = this.state.panes.map((_, i) => this.buildPane(i));
+    this.buildDividers();
     for (const b of document.querySelectorAll<HTMLButtonElement>('#split-seg button')) {
       b.classList.toggle('on', Number(b.dataset.n) === this.state.panes.length);
     }
@@ -701,15 +719,111 @@ class App implements TabHost {
         stacked = width > 0 && height > 0 ? height > width * (this.stacked ? 0.95 : 1.05) : this.stacked;
       }
     }
-    const tracks = `repeat(${n}, minmax(0, 1fr))`;
+    const tracks = this.paneShares(n, stacked).map((s) => `minmax(0, ${s.toFixed(5)}fr)`).join(' ');
     const columns = stacked ? 'minmax(0, 1fr)' : tracks;
     const rows = stacked ? tracks : 'minmax(0, 1fr)';
-    if (this.panesEl.style.gridTemplateColumns !== columns) this.panesEl.style.gridTemplateColumns = columns;
-    if (this.panesEl.style.gridTemplateRows !== rows) this.panesEl.style.gridTemplateRows = rows;
+    if (columns !== this.gridColumns || rows !== this.gridRows) {
+      this.gridColumns = columns;
+      this.gridRows = rows;
+      this.panesEl.style.gridTemplateColumns = columns;
+      this.panesEl.style.gridTemplateRows = rows;
+    }
     if (stacked !== this.stacked) {
       this.stacked = stacked;
       this.panesEl.classList.toggle('stacked', stacked);
     }
+    this.placeDividers();
+  }
+
+  /** Each pane's share of the pane area (adds up to 1), as last dragged, or equal. */
+  private paneShares(n: number, stacked: boolean): number[] {
+    const saved = this.state.paneSizes?.[stacked ? 'stack' : 'side'];
+    if (Array.isArray(saved) && saved.length === n && saved.every((v) => typeof v === 'number' && Number.isFinite(v) && v > 0)) {
+      const sum = saved.reduce((a, b) => a + b, 0);
+      return saved.map((v) => v / sum);
+    }
+    return Array<number>(n).fill(1 / n);
+  }
+
+  /**
+   * The dividers between panes: one between each pair, over the line between them.
+   * Dragging one moves that line (the panes on either side give and take); a
+   * double-click shares the area out equally again.
+   */
+  private buildDividers(): void {
+    this.dividers = [];
+    for (let i = 0; i + 1 < this.state.panes.length; i++) {
+      const el = h('div', { class: 'pane-split', title: 'Drag to resize · double-click to make all equal' });
+      this.bindDivider(el, i);
+      this.panesEl.append(el);
+      this.dividers.push(el);
+    }
+    this.placeDividers();
+  }
+
+  private placeDividers(): void {
+    if (!this.dividers.length) return;
+    for (let i = 0; i < this.dividers.length; i++) {
+      const next = this.panes[i + 1]?.root;
+      const el = this.dividers[i];
+      if (!next) continue;
+      el.classList.toggle('across', this.stacked);
+      // The 1 px gap just before the next pane is the line between the two.
+      if (this.stacked) {
+        el.style.left = '0';
+        el.style.top = `${next.offsetTop - 0.5}px`;
+      } else {
+        el.style.top = '0';
+        el.style.left = `${next.offsetLeft - 0.5}px`;
+      }
+    }
+  }
+
+  private bindDivider(el: HTMLElement, i: number): void {
+    el.addEventListener('pointerdown', (down) => {
+      if (down.button !== 0) return;
+      down.preventDefault();
+      const n = this.state.panes.length;
+      const stacked = this.stacked;
+      const start = this.paneShares(n, stacked);
+      const rect = this.panesEl.getBoundingClientRect();
+      const total = (stacked ? rect.height : rect.width) - (n - 1); // less the 1 px gaps
+      if (total <= 0) return;
+      el.setPointerCapture(down.pointerId);
+      el.classList.add('dragging');
+      document.body.classList.add(stacked ? 'pane-resizing-rows' : 'pane-resizing-cols');
+      const from = stacked ? down.clientY : down.clientX;
+      // Each pane keeps enough room for its title bar and a few lines.
+      const least = Math.min((stacked ? 90 : 160) / total, (start[i] + start[i + 1]) / 2);
+      const move = (e: PointerEvent) => {
+        const delta = ((stacked ? e.clientY : e.clientX) - from) / total;
+        const pair = start[i] + start[i + 1];
+        const a = clamp(start[i] + delta, least, pair - least);
+        const shares = start.slice();
+        shares[i] = a;
+        shares[i + 1] = pair - a;
+        this.state.paneSizes = { ...this.state.paneSizes, [stacked ? 'stack' : 'side']: shares.map((s) => Number(s.toFixed(5))) };
+        this.applyPaneDirection();
+      };
+      const up = () => {
+        el.classList.remove('dragging');
+        document.body.classList.remove('pane-resizing-rows', 'pane-resizing-cols');
+        el.removeEventListener('pointermove', move);
+        el.removeEventListener('pointerup', up);
+        el.removeEventListener('pointercancel', up);
+        this.scheduleSave();
+      };
+      el.addEventListener('pointermove', move);
+      el.addEventListener('pointerup', up);
+      el.addEventListener('pointercancel', up);
+    });
+    el.addEventListener('dblclick', () => {
+      const sizes = { ...this.state.paneSizes };
+      delete sizes[this.stacked ? 'stack' : 'side'];
+      this.state.paneSizes = sizes;
+      this.applyPaneDirection();
+      this.scheduleSave();
+    });
   }
 
   private buildPane(i: number): PaneEls {
@@ -2183,6 +2297,16 @@ class App implements TabHost {
     this.appEl.classList.toggle('lib-closed', !this.state.libraryOpen);
   }
 
+  /** Every divider back where it starts: sidebar, library, and equal panes. */
+  resetSizes(): void {
+    this.state.sidebarWidth = DEFAULT_SIDEBAR_WIDTH;
+    this.state.libraryWidth = DEFAULT_LIBRARY_WIDTH;
+    delete this.state.paneSizes;
+    this.applyLayoutVars();
+    this.applyPaneDirection();
+    this.scheduleSave();
+  }
+
   toggleLibrary(open = !this.state.libraryOpen): void {
     this.state.libraryOpen = open;
     this.applyLayoutVars();
@@ -2224,6 +2348,7 @@ class App implements TabHost {
     document.getElementById('btn-settings')!.addEventListener('click', () => this.showSettings());
     document.getElementById('btn-open')!.addEventListener('click', () => this.showSessions());
     document.getElementById('btn-resume-all')!.addEventListener('click', () => void this.resumeAll());
+    document.getElementById('btn-reset-sizes')!.addEventListener('click', () => this.resetSizes());
     document.getElementById('zoom-in')!.addEventListener('click', () => this.setFontSize(this.state.fontSize + 1));
     document.getElementById('zoom-out')!.addEventListener('click', () => this.setFontSize(this.state.fontSize - 1));
     document.getElementById('zoom-val')!.addEventListener('dblclick', () => this.setFontSize(DEFAULT_FONT));

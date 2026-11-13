@@ -1,6 +1,6 @@
 [package]
 name = "termdeck"
-version = "0.1.1"
+version = "0.1.2"
 description = "Portable multi-session terminal for AI coding CLIs"
 license = "MIT"
 repository = "https://github.com/aivrar/TermDeck"

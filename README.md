@@ -20,6 +20,7 @@ them in an SDK or keep its own copy of your conversations.
 
 - **Many sessions, one window.** Claude Code, Codex, Grok Build, PowerShell, cmd, Git Bash
   and WSL tabs. Show 1, 2 or 3 at once; they stack top-to-bottom on a portrait monitor.
+  Drag the lines between them to resize; **Reset sizes** puts everything back.
 - **Status at a glance.** Each tab shows working, finished, needs you (permission prompt
   or question), idle or ended, plus its topic, folder, CPU and memory. Optional taskbar
   flash and sound when a session finishes or needs you.
@@ -55,7 +56,7 @@ More in the [wiki](https://github.com/aivrar/TermDeck/wiki).
 
 ## Download and run
 
-1. Download [`TermDeck-0.1.1-portable.zip`](https://github.com/aivrar/TermDeck/releases/download/v0.1.1/TermDeck-0.1.1-portable.zip)
+1. Download [`TermDeck-0.1.2-portable.zip`](https://github.com/aivrar/TermDeck/releases/download/v0.1.2/TermDeck-0.1.2-portable.zip)
    from the [latest release](https://github.com/aivrar/TermDeck/releases/latest).
 2. Unzip it anywhere — another drive or a USB stick is fine.
 3. Run `TermDeck.exe`.

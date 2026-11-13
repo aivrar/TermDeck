@@ -45,7 +45,8 @@ $tests = @(
     @{ id = '20'; file = '20-background-job.mjs'; args = @($work) },
     @{ id = '21'; file = '21-audit2.mjs';        args = @($work) },
     @{ id = '22'; file = '22-process-control.mjs'; args = @($work, $WslDistro) },
-    @{ id = '23'; file = '23-copy-select.mjs';   args = @($work) }
+    @{ id = '23'; file = '23-copy-select.mjs';   args = @($work) },
+    @{ id = '24'; file = '24-pane-dividers.mjs'; args = @($work) }
 )
 
 $failed = @()

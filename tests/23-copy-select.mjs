@@ -161,9 +161,34 @@ try {
 
   clipboardText('BEFORE-PLAIN-DRAG');
   await drag(i, trow, 0, 14);
+  check('a "Copied" tag shows by the mouse', await until(() => ev(() => document.querySelector('.mouse-tip')?.textContent === 'Copied'), 1000, 30));
   check('a plain drag still highlights and copies', await until(() => clip() === 'TRACK-MARK-5150'), JSON.stringify(clip()));
   const plain = await ev((n) => window.__sent.slice(n).join(''), sentMark);
   check('…and the program does not get the drag', !/\x1b\[<(0|32);/.test(plain), JSON.stringify(plain.slice(0, 60)));
+  await sleep(1300);
+  check('…and goes away by itself', !(await ev(() => !!document.querySelector('.mouse-tip'))));
+
+  // Moving the mouse afterwards (the program asked for every move) keeps the highlight.
+  const sentMoves = await ev(() => window.__sent.length);
+  const m0 = await cellAt(i, 30, trow + 3);
+  await page.mouse.move(m0.x, m0.y, { steps: 6 });
+  await page.mouse.move(m0.x + 200, m0.y + 60, { steps: 6 });
+  await sleep(300);
+  check('moving the mouse afterwards keeps the highlight', await ev((i) => window.__termdeck.app.tabs[i].term.hasSelection(), i));
+  check('…(those moves are not passed to the program while something is highlighted)', (await ev((n) => window.__sent.slice(n).join(''), sentMoves)) === '');
+
+  // The program redraws under the highlight: right-click still inserts what was copied.
+  await ev(([i, row]) => window.__termdeck.app.tabs[i].term.write(`\x1b7\x1b[${row + 1};1HREDRAWN-OVER-IT\x1b8`), [i, trow]);
+  await sleep(300);
+  clipboardText('SOMETHING-ELSE');
+  const sentRedraw = await ev(() => window.__sent.length);
+  await page.mouse.click(m0.x, m0.y, { button: 'right' });
+  await sleep(700);
+  const afterRedraw = await ev((n) => window.__sent.slice(n).join(''), sentRedraw);
+  check('right-click inserts what was copied, even after the screen under it changed', afterRedraw.includes('TRACK-MARK-5150') && !afterRedraw.includes('REDRAWN') && !afterRedraw.includes('SOMETHING-ELSE'), JSON.stringify(afterRedraw.slice(0, 80)));
+  await send(page, i, '\x1b');
+  await ev(([i, row]) => window.__termdeck.app.tabs[i].term.write(`\x1b7\x1b[${row + 1};1HTRACK-MARK-5150\x1b8`), [i, trow]);
+  await sleep(200);
 
   // A plain click (no drag) still reaches the program, press and release.
   const sentClick = await ev(() => window.__sent.length);

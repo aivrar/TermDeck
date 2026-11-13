@@ -374,10 +374,25 @@ const PS_ADD_LINE = '\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_';
 
 let spawnSeq = 0;
 
+/** A small tag beside the mouse pointer ("Copied") that fades away by itself. */
+function showTip(text: string, x: number, y: number, bad = false): void {
+  document.querySelector('.mouse-tip')?.remove();
+  const tip = document.createElement('div');
+  tip.className = bad ? 'mouse-tip bad' : 'mouse-tip';
+  tip.textContent = text;
+  tip.style.left = `${Math.min(x + 12, window.innerWidth - 120)}px`;
+  tip.style.top = `${Math.max(y - 30, 4)}px`;
+  document.body.append(tip);
+  window.setTimeout(() => tip.classList.add('gone'), 700);
+  window.setTimeout(() => tip.remove(), 1100);
+}
+
 export class Tab {
   readonly el: HTMLDivElement;
   readonly term: Terminal;
   private readonly fit = new FitAddon();
+  /** The text copied by the current highlight (null when there is none). */
+  private copied: string | null = null;
   /** Listeners this tab puts on the whole window; removed when the tab goes. */
   private readonly windowListeners = new AbortController();
   private webgl: WebglAddon | null = null;
@@ -549,7 +564,9 @@ export class Tab {
     this.el.addEventListener('mouseup', ownRightButton, true);
     this.el.addEventListener('contextmenu', (e) => {
       e.preventDefault();
-      const text = this.term.hasSelection() ? this.term.getSelection() : '';
+      // What was copied when the highlight was made: a CLI may have redrawn the screen
+      // under the highlight since.
+      const text = this.term.hasSelection() ? (this.copied ?? this.term.getSelection()) : '';
       if (text) {
         this.term.clearSelection();
         this.insert(text);
@@ -637,13 +654,34 @@ export class Tab {
         replay(false); // let go in place: the CLI gets its click (this mouseup follows)
         if (!pressed) return;
         pressed = false;
+        const { clientX: x, clientY: y } = e;
         window.setTimeout(() => {
           const text = this.term.hasSelection() ? this.term.getSelection() : '';
-          if (text.trim()) void api.clipboardWrite(text).catch(() => {});
+          if (!text.trim()) return;
+          this.copied = text;
+          api.clipboardWrite(text).then(
+            () => showTip('Copied', x, y),
+            () => showTip('Could not copy', x, y, true),
+          );
         }, 0);
       },
       { capture: true, signal: this.windowListeners.signal },
     );
+    // A CLI that takes the mouse is told about every move, and xterm.js counts that as
+    // typing, which drops the highlight. So while something is highlighted, plain moves
+    // (no button held) are not passed on: the highlight stays until a click, a key, the
+    // wheel or a right-click.
+    this.el.addEventListener(
+      'mousemove',
+      (e) => {
+        if (e.buttons === 0 && this.term.modes.mouseTrackingMode !== 'none' && this.term.hasSelection()) e.stopPropagation();
+      },
+      true,
+    );
+    // A new or cleared highlight forgets what was copied (set again on let-go).
+    this.term.onSelectionChange(() => {
+      this.copied = null;
+    });
   }
 
   // ---------- process ----------

@@ -157,6 +157,9 @@ body.tab-dragging { cursor: grabbing; user-select: none; }
 .pane-split::after { content: ''; position: absolute; inset: 0 3px; background: transparent; transition: background .1s; }
 .pane-split.across::after { inset: 3px 0; }
 .pane-split:hover::after, .pane-split.dragging::after { background: var(--accent); }
+.mouse-tip { position: fixed; z-index: 1000; pointer-events: none; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; color: #eaf3ff; background: #1f4f86; border: 1px solid #2c66a8; box-shadow: 0 2px 8px rgba(0,0,0,.4); opacity: 1; transition: opacity .35s; }
+.mouse-tip.bad { background: #6b2a2a; border-color: #a84040; }
+.mouse-tip.gone { opacity: 0; }
 body.pane-resizing-cols, body.pane-resizing-cols * { cursor: col-resize !important; user-select: none; }
 body.pane-resizing-rows, body.pane-resizing-rows * { cursor: row-resize !important; user-select: none; }
 .pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--term-bg); position: relative; }

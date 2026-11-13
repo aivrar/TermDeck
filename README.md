@@ -56,7 +56,7 @@ More in the [wiki](https://github.com/aivrar/TermDeck/wiki).
 
 ## Download and run
 
-1. Download [`TermDeck-0.1.2-portable.zip`](https://github.com/aivrar/TermDeck/releases/download/v0.1.2/TermDeck-0.1.2-portable.zip)
+1. Download [`TermDeck-0.1.3-portable.zip`](https://github.com/aivrar/TermDeck/releases/download/v0.1.3/TermDeck-0.1.3-portable.zip)
    from the [latest release](https://github.com/aivrar/TermDeck/releases/latest).
 2. Unzip it anywhere — another drive or a USB stick is fine.
 3. Run `TermDeck.exe`.

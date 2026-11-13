@@ -141,7 +141,8 @@ try {
   await page.keyboard.type('Q');
   await waitText(page, 0, /^RAW-DOWN$[\s\S]*PS .*>/m, 20000, 400);
   await send(page, 0, `powershell -NoProfile -ExecutionPolicy Bypass -File "${path.join(ROOT, 'tests', 'fixtures', 'keyecho.ps1')}"\r`);
-  await sleep(1500);
+  await waitText(page, 0, /^RAW-DOWN$[\s\S]*^KEYECHO READY$/m, 20000, 400);
+  await sleep(300);
 
   // Typing still lands in the program after all that.
   const n = (await keyLines()).length;

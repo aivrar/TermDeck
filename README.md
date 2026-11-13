@@ -94,6 +94,7 @@ The exe is not code-signed, so Windows SmartScreen may warn the first time
 | Ctrl+Shift+K twice | Emergency stop: end everything the focused tab started |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Zoom |
 | Ctrl+C | Copy if text is selected, otherwise sent to the CLI |
+| Highlight / right-click | Highlighting copies; right-click puts the highlighted text (or the clipboard) into the input, without sending |
 
 Full list: [wiki → Hotkeys](https://github.com/aivrar/TermDeck/wiki/Hotkeys).
 

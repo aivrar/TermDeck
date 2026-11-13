@@ -378,6 +378,8 @@ export class Tab {
   readonly el: HTMLDivElement;
   readonly term: Terminal;
   private readonly fit = new FitAddon();
+  /** Listeners this tab puts on the whole window; removed when the tab goes. */
+  private readonly windowListeners = new AbortController();
   private webgl: WebglAddon | null = null;
   private opened = false;
   private shown = false;
@@ -514,15 +516,134 @@ export class Tab {
       return true;
     });
 
+    // OSC 52 — a program putting text on the clipboard. Claude Code's full-screen mode
+    // copies what you highlight in it this way. Writing only: a request to *read* the
+    // clipboard ("?") is ignored, so no program can see what is on it.
+    this.term.parser.registerOscHandler(52, (data) => {
+      const at = data.indexOf(';');
+      const payload = at < 0 ? '' : data.slice(at + 1);
+      if (!payload || payload === '?' || payload.length > 16_000_000) return true;
+      try {
+        const bytes = Uint8Array.from(atob(payload), (c) => c.charCodeAt(0));
+        const text = new TextDecoder().decode(bytes);
+        if (text) void api.clipboardWrite(text).catch(() => {});
+      } catch {
+        /* not base64: nothing to copy */
+      }
+      return true;
+    });
+
     this.term.attachCustomKeyEventHandler((e) => this.onKey(e));
+    this.ownLeftDrag();
+    // Right-click puts text into the input (not sent — Enter stays yours): what is
+    // highlighted here, or else what is on the clipboard, which is also where a CLI
+    // that highlights by itself (Claude Code full-screen) has just copied it to.
+    // The right button is the app's own, also while a CLI is taking the mouse: it is
+    // kept from the CLI, which would otherwise get it as a click.
+    const ownRightButton = (e: MouseEvent) => {
+      if (e.button !== 2) return;
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    this.el.addEventListener('mousedown', ownRightButton, true);
+    this.el.addEventListener('mouseup', ownRightButton, true);
     this.el.addEventListener('contextmenu', (e) => {
       e.preventDefault();
-      // A CLI that has asked for mouse events gets the right-click itself; hold
-      // Shift to use the terminal's own copy/paste instead.
-      if (this.term.modes.mouseTrackingMode !== 'none' && !e.shiftKey) return;
-      if (this.term.hasSelection()) this.copySelection();
-      else this.host.pasteInto(this);
+      const text = this.term.hasSelection() ? this.term.getSelection() : '';
+      if (text) {
+        this.term.clearSelection();
+        this.insert(text);
+      } else {
+        this.host.pasteInto(this);
+      }
+      this.term.focus();
     });
+  }
+
+  /**
+   * Highlighting copies: the moment the mouse button is let go, what is highlighted is
+   * on the clipboard. It stays highlighted (for right-click).
+   *
+   * A drag always highlights, also in a CLI that has taken the mouse (Claude Code's
+   * full-screen view does): such a CLI does not get the drag, but still gets a plain
+   * click and the wheel. Until the mouse moves a few pixels the press is held back;
+   * then it becomes either the start of a highlight (as a Shift+drag would) or, let
+   * go in place, a click passed on to the CLI.
+   */
+  private ownLeftDrag(): void {
+    let pressed = false; // the left button went down in this tab
+    let held: { down: MouseEvent; target: EventTarget } | null = null;
+    let replaying = false;
+    const again = (type: 'mousedown', from: MouseEvent, shiftKey: boolean) =>
+      new MouseEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: window,
+        clientX: from.clientX,
+        clientY: from.clientY,
+        screenX: from.screenX,
+        screenY: from.screenY,
+        button: 0,
+        buttons: 1,
+        detail: 1,
+        shiftKey,
+      });
+    const replay = (shiftKey: boolean) => {
+      if (!held) return;
+      const { down, target } = held;
+      held = null;
+      replaying = true;
+      try {
+        target.dispatchEvent(again('mousedown', down, shiftKey));
+      } finally {
+        replaying = false;
+      }
+    };
+
+    this.el.addEventListener(
+      'mousedown',
+      (e) => {
+        if (e.button !== 0 || replaying) return;
+        pressed = true;
+        const plain = !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
+        if (!plain || e.detail > 1 || this.term.modes.mouseTrackingMode === 'none' || !e.target) return;
+        e.preventDefault();
+        e.stopPropagation();
+        this.term.clearSelection();
+        this.term.focus();
+        held = { down: e, target: e.target };
+      },
+      true,
+    );
+    window.addEventListener(
+      'mousemove',
+      (e) => {
+        if (!held) return;
+        if (!(e.buttons & 1)) {
+          held = null;
+          return;
+        }
+        const dx = Math.abs(e.clientX - held.down.clientX);
+        const dy = Math.abs(e.clientY - held.down.clientY);
+        if (dx >= 4 || dy >= 4) replay(true); // a drag: highlight from where it began
+      },
+      { capture: true, signal: this.windowListeners.signal },
+    );
+    window.addEventListener(
+      'mouseup',
+      (e) => {
+        if (e.button !== 0) return;
+        replay(false); // let go in place: the CLI gets its click (this mouseup follows)
+        if (!pressed) return;
+        pressed = false;
+        window.setTimeout(() => {
+          const text = this.term.hasSelection() ? this.term.getSelection() : '';
+          if (text.trim()) void api.clipboardWrite(text).catch(() => {});
+        }, 0);
+      },
+      { capture: true, signal: this.windowListeners.signal },
+    );
   }
 
   // ---------- process ----------
@@ -1368,6 +1489,7 @@ export class Tab {
     this.kill();
     window.clearTimeout(this.fitTimer);
     window.clearTimeout(this.ackTimer);
+    this.windowListeners.abort();
     this.dropRenderer();
     this.term.dispose();
     this.el.remove();

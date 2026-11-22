@@ -206,6 +206,7 @@ fn update_command(cli: &str) -> Option<&'static str> {
         "claude" => Some("claude update"),
         "codex" => Some("codex update"),
         "grok" => Some("grok update"),
+        "agy" => Some("agy update"),
         _ => None,
     }
 }
@@ -220,6 +221,7 @@ pub fn cli_versions() -> Vec<CliVersion> {
         ("codex", std::thread::spawn(move || run("codex --version", short, OnClose::End))),
         ("grok", std::thread::spawn(move || run("grok update --check --json", net, OnClose::End))),
         ("grok-v", std::thread::spawn(move || run("grok --version", short, OnClose::End))),
+        ("agy", std::thread::spawn(move || run("agy --version", short, OnClose::End))),
         ("npm-codex", std::thread::spawn(move || run("npm view @openai/codex version", net, OnClose::End))),
         ("npm-claude", std::thread::spawn(move || run("npm view @anthropic-ai/claude-code dist-tags --json", net, OnClose::End))),
     ];
@@ -274,6 +276,14 @@ pub fn cli_versions() -> Vec<CliVersion> {
     }
     if c.installed.is_none() {
         c.installed = ok("grok-v").and_then(|t| first_version(&t));
+    }
+    out.push(c);
+
+    // Antigravity updates itself in the background and has no check-only command.
+    let mut c = CliVersion { cli: "agy".into(), command: "agy update".into(), running: count("agy"), ..Default::default() };
+    c.installed = ok("agy").and_then(|t| first_version(&t));
+    if c.installed.is_some() {
+        c.note = Some("Antigravity has no check-only command — it updates itself in the background, or use Update anyway.".into());
     }
     out.push(c);
     out

@@ -140,7 +140,8 @@ function fmtSize(bytes: number): string {
 
 type UpdateMode = 'off' | 'check' | 'auto';
 type RealCli = Exclude<CliKind, 'none'>;
-const CLI_NAME: Record<RealCli, string> = { claude: 'Claude Code', codex: 'Codex', grok: 'Grok' };
+const REAL_CLIS: RealCli[] = ['claude', 'codex', 'grok', 'agy'];
+const CLI_NAME: Record<RealCli, string> = { claude: 'Claude Code', codex: 'Codex', grok: 'Grok', agy: 'Antigravity' };
 const sleep = (ms: number) => new Promise<void>((r) => window.setTimeout(r, ms));
 
 const DEFAULT_FONT = 14;
@@ -218,7 +219,7 @@ class App implements TabHost {
     recentDirs: [],
     lastShell: 'powershell',
     updateMode: 'check',
-    cliFlags: { claude: '', codex: '', grok: '' },
+    cliFlags: { claude: '', codex: '', grok: '', agy: '' },
     resumeMode: 'manual',
     settings: { ...DEFAULT_SETTINGS },
   };
@@ -321,7 +322,7 @@ class App implements TabHost {
     this.state.fontSize = clamp(this.state.fontSize || DEFAULT_FONT, MIN_FONT, MAX_FONT);
     if (!Array.isArray(this.state.panes) || !this.state.panes.length) this.state.panes = [null];
     const savedFlags = (this.state.cliFlags ?? {}) as Partial<Record<RealCli, string>>;
-    this.state.cliFlags = { claude: savedFlags.claude ?? '', codex: savedFlags.codex ?? '', grok: savedFlags.grok ?? '' };
+    this.state.cliFlags = { claude: savedFlags.claude ?? '', codex: savedFlags.codex ?? '', grok: savedFlags.grok ?? '', agy: savedFlags.agy ?? '' };
     this.state.panes = this.state.panes.slice(0, 3);
     this.state.settings = cleanSettings(this.state.settings);
     this.applyLook();
@@ -1238,13 +1239,14 @@ class App implements TabHost {
       claude: h('input', { value: this.state.cliFlags.claude, spellcheck: false, placeholder: 'none — e.g. --dangerously-skip-permissions' }),
       codex: h('input', { value: this.state.cliFlags.codex, spellcheck: false, placeholder: 'none' }),
       grok: h('input', { value: this.state.cliFlags.grok, spellcheck: false, placeholder: 'none' }),
+      agy: h('input', { value: this.state.cliFlags.agy, spellcheck: false, placeholder: 'none — e.g. --dangerously-skip-permissions' }),
     };
     const preview = h('code', { class: 'flag-preview' });
     const paint = () => {
       if (cli === 'none') return;
       // Shown exactly as it will be typed, quoted for this tab's shell.
       const words = shellFlags(mergeFlags(all[cli].value.trim(), own.value), tab.state.shell);
-      const base = tab.state.sessionId ? { claude: `claude --resume ${tab.state.sessionId}`, codex: `codex resume ${tab.state.sessionId}`, grok: `grok --resume ${tab.state.sessionId}` }[cli] : cli;
+      const base = tab.state.sessionId ? { claude: `claude --resume ${tab.state.sessionId}`, codex: `codex resume ${tab.state.sessionId}`, grok: `grok --resume ${tab.state.sessionId}`, agy: `agy --conversation ${tab.state.sessionId}` }[cli] : cli;
       preview.textContent = `${base}${words ? ` ${words}` : ''}`;
     };
     for (const el of [own, ...Object.values(all)]) el.addEventListener('input', paint);
@@ -1261,6 +1263,7 @@ class App implements TabHost {
       h('div', { class: 'field' }, h('label', null, 'Every Claude Code session started or resumed here'), all.claude),
       h('div', { class: 'field' }, h('label', null, 'Every Codex session'), all.codex),
       h('div', { class: 'field' }, h('label', null, 'Every Grok session'), all.grok),
+      h('div', { class: 'field' }, h('label', null, 'Every Antigravity session'), all.agy),
       h('p', { class: 'proc-note' }, 'Applies to sessions the app starts: New session, Resume, Resume all. A CLI you start by typing its command is left exactly as you typed it — and its switches are then remembered for that tab.'),
     );
     modal('CLI flags', body, [
@@ -1269,7 +1272,7 @@ class App implements TabHost {
         label: 'Save',
         kind: 'primary',
         onClick: () => {
-          for (const k of ['claude', 'codex', 'grok'] as RealCli[]) this.state.cliFlags[k] = all[k].value.trim();
+          for (const k of REAL_CLIS) this.state.cliFlags[k] = all[k].value.trim();
           if (cli !== 'none' && own.value.trim() !== (tab.state.flags ?? '')) {
             tab.state.flags = own.value.trim() || undefined;
             tab.state.flagsManual = true;
@@ -1908,7 +1911,7 @@ class App implements TabHost {
       h('div', { class: 'field' }, h('label', null, 'When TermDeck starts — updates'), mode),
       h('div', { class: 'field' }, h('label', null, 'When TermDeck starts — sessions that were open'), resumeMode),
       h('p', { class: 'proc-note' }, 'Automatic resume always waits for the update step. With updates on "automatic", updates are installed first and then everything resumes. With "check and tell me", sessions of a CLI that has an update waiting are left for you, so the update is not blocked; the rest resume.'),
-      h('p', { class: 'proc-note' }, 'Update runs each CLI\'s own update command, exactly as if you typed it. At startup nothing is running yet, so that is when an update can never be blocked by an open session. Claude Code and Grok also update themselves in the background; Codex does not.'),
+      h('p', { class: 'proc-note' }, 'Update runs each CLI\'s own update command, exactly as if you typed it. At startup nothing is running yet, so that is when an update can never be blocked by an open session. Claude Code, Grok and Antigravity also update themselves in the background; Codex does not.'),
     );
     this.updatesView = paint;
     paint();
@@ -1945,6 +1948,7 @@ class App implements TabHost {
       claude: '--dangerously-skip-permissions',
       codex: '--dangerously-bypass-approvals-and-sandbox',
       grok: '--always-approve',
+      agy: '--dangerously-skip-permissions',
     };
     const input = h('input', { class: 'flags-own', spellcheck: false, placeholder: 'none — e.g. --dangerously-skip-permissions', oninput: () => paint() });
     const quick = h('button', { class: 'btn small ghost flags-quick', title: 'Adds the switch that lets this CLI work without asking for permission each time' });
@@ -2026,7 +2030,7 @@ class App implements TabHost {
       cli,
       shell: openShell(),
       command: chosen && /^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$/.test(chosen)
-        ? { claude: `claude --resume ${chosen}`, codex: `codex resume ${chosen}`, grok: `grok --resume ${chosen}` }[cli]
+        ? { claude: `claude --resume ${chosen}`, codex: `codex resume ${chosen}`, grok: `grok --resume ${chosen}`, agy: `agy --conversation ${chosen}` }[cli]
         : cli,
     }));
     const mark = () => {
@@ -2034,7 +2038,7 @@ class App implements TabHost {
       switches.paint();
     };
     const paint = () => {
-      cliRow.replaceChildren(...(['claude', 'codex', 'grok'] as RealCli[]).map((c) =>
+      cliRow.replaceChildren(...REAL_CLIS.map((c) =>
         h('button', { class: `choice ${c === cli ? 'on' : ''}`, 'data-cli': c, onclick: () => { cli = c; void load(); } }, CLI_NAME[c])));
       const rows = matching();
       if (!rows.some((s) => s.id === chosen)) chosen = rows[0]?.id ?? '';
@@ -2156,6 +2160,7 @@ class App implements TabHost {
       claude: h('input', { value: this.state.cliFlags.claude, spellcheck: false, placeholder: 'none — e.g. --dangerously-skip-permissions' }),
       codex: h('input', { value: this.state.cliFlags.codex, spellcheck: false, placeholder: 'none' }),
       grok: h('input', { value: this.state.cliFlags.grok, spellcheck: false, placeholder: 'none' }),
+      agy: h('input', { value: this.state.cliFlags.agy, spellcheck: false, placeholder: 'none — e.g. --dangerously-skip-permissions' }),
     };
     const dataPath = h('div', { class: 'set-path' }, '…');
     void api.dataDir().then((d) => (dataPath.textContent = d)).catch(() => {});
@@ -2186,9 +2191,10 @@ class App implements TabHost {
       ),
       h('h3', { class: 'set-h' }, 'Switches added to every session the app starts or resumes'),
       h('div', { class: 'set-grid' },
-        h('div', { class: 'field span2' }, h('label', null, 'Claude Code'), flags.claude),
+        h('div', { class: 'field' }, h('label', null, 'Claude Code'), flags.claude),
         h('div', { class: 'field' }, h('label', null, 'Codex'), flags.codex),
         h('div', { class: 'field' }, h('label', null, 'Grok'), flags.grok),
+        h('div', { class: 'field' }, h('label', null, 'Antigravity'), flags.agy),
       ),
       h('h3', { class: 'set-h' }, 'Where TermDeck keeps its own files'),
       dataPath,
@@ -2230,7 +2236,7 @@ class App implements TabHost {
           });
           this.state.updateMode = update.value as UpdateMode;
           this.state.resumeMode = resume.value as 'manual' | 'auto';
-          for (const k of ['claude', 'codex', 'grok'] as RealCli[]) this.state.cliFlags[k] = flags[k].value.trim();
+          for (const k of REAL_CLIS) this.state.cliFlags[k] = flags[k].value.trim();
           this.applyLook();
           this.applyPaneDirection();
           if (Number.isFinite(Number(size.value)) && size.value !== '') this.setFontSize(Number(size.value));
@@ -2464,7 +2470,7 @@ class App implements TabHost {
     const switches = this.flagsField(() => ({ cli, shell, command: cli }));
     const paint = () => {
       shellRow.replaceChildren(...shells.map((s) => h('button', { class: `choice ${s === shell ? 'on' : ''}`, onclick: () => { shell = s; paint(); } }, SHELL_LABEL[s])));
-      cliRow.replaceChildren(...(['none', 'claude', 'codex', 'grok'] as CliKind[]).map((c) =>
+      cliRow.replaceChildren(...(['none', ...REAL_CLIS] as CliKind[]).map((c) =>
         h('button', { class: `choice ${c === cli ? 'on' : ''}`, onclick: () => { cli = c; paint(); } }, c === 'none' ? 'Just the shell' : c)));
       distroField.hidden = shell !== 'wsl';
       dirHint.textContent = shell === 'wsl' ? 'Folder (a Windows path or a Linux path such as ~/project)' : 'Folder';

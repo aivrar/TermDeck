@@ -210,12 +210,14 @@ const NOT_KEPT: Record<Exclude<CliKind, 'none'>, string[]> = {
   claude: ['--resume', '-r', '--continue', '-c', '--print', '-p', '--fork-session', '--teleport', '--from-pr', '--session-id', '--version', '-v', '--help', '-h'],
   codex: ['--last', '--all', '--version', '-V', '--help', '-h'],
   grok: ['--resume', '-r', '--continue', '-c', '--fork-session', '--session-id', '-s', '--version', '-v', '--help', '-h'],
+  agy: ['--conversation', '--continue', '-c', '--print', '-p', '--prompt', '--prompt-interactive', '-i', '--version', '--help', '-h'],
 };
 // Switches known to take a value as the next word; kept together with it.
 const TAKES_VALUE: Record<Exclude<CliKind, 'none'>, string[]> = {
   claude: ['--permission-mode', '--model'],
   codex: ['--sandbox', '-s', '--ask-for-approval', '-a', '--model', '-m'],
   grok: ['--permission-mode', '--model', '-m'],
+  agy: ['--model', '--mode', '--effort', '--agent', '--add-dir', '--project', '--settings', '--log-file', '--input-format', '--output-format', '--json-schema', '--print-timeout'],
 };
 
 /**
@@ -364,6 +366,7 @@ const NEWLINE_KEY: Record<CliKind, string> = {
   claude: '\x1b\r',
   codex: '\n',
   grok: '\x1b\r',
+  agy: '\x1b\r',
 };
 
 /**
@@ -1158,8 +1161,10 @@ export class Tab {
     const pause = (ms: number) => new Promise<void>((r) => window.setTimeout(r, ms));
     const began = performance.now();
     // The first Ctrl+C may only stop running work or clear the input; the next two quit.
-    for (let n = 0; n < 4 && this.cliRunning !== 'none' && performance.now() - began < maxMs; n++) {
-      this.send('\x03');
+    // Antigravity exits on Ctrl+D twice (after cancelling any running work).
+    const isAgy = this.cliRunning === 'agy';
+    for (let n = 0; n < (isAgy ? 5 : 4) && this.cliRunning !== 'none' && performance.now() - began < maxMs; n++) {
+      this.send(isAgy && n > 0 ? '\x04' : '\x03');
       await pause(350);
       await this.host.refresh();
     }
@@ -1383,7 +1388,7 @@ export class Tab {
     this.procs = st?.procs ?? [];
     this.cliPid = st?.cliPid ?? null;
     if (this.exited) return false;
-    const key = () => `${this.activity}|${this.cliRunning}|${this.cliStatus}|${this.waitingFor}|${this.sessionName}|${this.state.cli}|${this.state.sessionId}|${this.state.flags}`;
+    const key = () => `${this.activity}|${this.cliRunning}|${this.cliStatus}|${this.waitingFor}|${this.sessionName}|${this.state.cli}|${this.state.sessionId}|${this.state.flags}|${this.resumePending}`;
     const before = key();
     const now = performance.now();
     const inspectable = this.state.shell !== 'wsl'; // Linux processes are not visible from Windows
@@ -1395,10 +1400,15 @@ export class Tab {
           this.muteUntil = now + 4000;
           this.outTimes = [];
         }
+        const switched = this.state.cli !== 'none' && this.state.cli !== st.cli;
+        const freshStart = switched || this.resumePending;
         this.cliRunning = st.cli;
         this.cliSeen = true;
         this.resumePending = false;
         this.state.cli = st.cli;
+        // Starting a different CLI (or typing one by hand while the Resume bar was up)
+        // must not carry over the previous conversation's id.
+        if (freshStart) this.state.sessionId = undefined;
         if (st.sessionId) this.state.sessionId = st.sessionId;
         // Flags typed in by hand for another CLI do not carry over to this one.
         if (this.state.flagsManual && this.state.flagsCli && this.state.flagsCli !== st.cli) {
@@ -1419,14 +1429,12 @@ export class Tab {
           this.held = null;
           this.dropUnsavedSession();
         } else if (this.cliSeen) {
-          // The CLI was running and has been closed: nothing to resume later.
+          // The CLI exited (e.g. Ctrl+C, Ctrl+D, /exit): offer the Resume bar so it can
+          // be reopened with one click, or Dismiss to leave this as a plain shell.
           this.cliSeen = false;
-          // Hand-typed flags stay for the next time that CLI is started here — noted
-          // as that CLI's (tabs saved before this was recorded have no note yet).
           if (this.state.flagsManual && !this.state.flagsCli && this.state.cli !== 'none') this.state.flagsCli = this.state.cli;
-          this.state.cli = 'none';
-          this.state.sessionId = undefined;
-          if (!this.state.flagsManual) this.state.flags = undefined;
+          this.resumePending = this.state.cli !== 'none';
+          this.dropUnsavedSession();
         }
       }
     } else {
@@ -1495,8 +1503,8 @@ export class Tab {
     // Remembered as plain words; quoted here for the shell they are typed into.
     const flags = shellFlags(this.flags(), this.state.shell);
     const tail = flags ? ` ${flags}` : '';
-    if (id) return { claude: `claude --resume ${id}`, codex: `codex resume ${id}`, grok: `grok --resume ${id}` }[cli] + tail;
-    if (this.state.shell === 'wsl') return { claude: 'claude --continue', codex: 'codex resume --last', grok: 'grok --continue' }[cli] + tail;
+    if (id) return { claude: `claude --resume ${id}`, codex: `codex resume ${id}`, grok: `grok --resume ${id}`, agy: `agy --conversation ${id}` }[cli] + tail;
+    if (this.state.shell === 'wsl') return { claude: 'claude --continue', codex: 'codex resume --last', grok: 'grok --continue', agy: 'agy --continue' }[cli] + tail;
     return cli + tail;
   }
 

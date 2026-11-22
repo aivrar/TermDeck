@@ -1,7 +1,7 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 
 export type ShellKind = 'powershell' | 'pwsh' | 'cmd' | 'gitbash' | 'wsl';
-export type CliKind = 'none' | 'claude' | 'codex' | 'grok';
+export type CliKind = 'none' | 'claude' | 'codex' | 'grok' | 'agy';
 
 export interface EnvInfo {
   home: string;

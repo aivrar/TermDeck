@@ -53,18 +53,152 @@ pub(crate) fn home() -> PathBuf {
 }
 
 /// The folder a CLI keeps its files in: its own setting when one is set
-/// (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`), otherwise the usual one in the user folder.
-/// The CLIs in the tabs get the app's environment, so this is the folder they use.
+/// (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `ANTIGRAVITY_APP_DATA_DIR`), otherwise the usual
+/// one in the user folder. The CLIs in the tabs get the app's environment, so this is
+/// the folder they use.
 pub(crate) fn cli_home(cli: &str) -> PathBuf {
     let (var, dir) = match cli {
         "claude" => ("CLAUDE_CONFIG_DIR", ".claude"),
         "codex" => ("CODEX_HOME", ".codex"),
+        "agy" => ("ANTIGRAVITY_APP_DATA_DIR", r".gemini\antigravity-cli"),
         _ => ("", ".grok"),
     };
     match std::env::var_os(var).filter(|v| !var.is_empty() && !v.is_empty()) {
         Some(v) => PathBuf::from(v),
         None => home().join(dir),
     }
+}
+
+/// Metadata Antigravity keeps for a conversation (read-only, best-effort).
+#[derive(Default, Clone)]
+pub(crate) struct AgyMeta {
+    pub cwd: String,
+    pub title: String,
+    pub preview: String,
+    pub is_internal: bool,
+}
+
+/// `file:///E:/terminal` -> `E:\terminal`. Plain paths are returned trimmed.
+pub(crate) fn agy_file_uri_to_path(uri: &str) -> Option<String> {
+    let raw = uri.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let rest = raw.strip_prefix("file:///").or_else(|| raw.strip_prefix("FILE:///")).unwrap_or(raw);
+    let mut p = percent_decode(rest).replace('/', "\\");
+    // Normalise lowercase drive letter ("e:\foo" -> "E:\foo") for readable display.
+    let bytes = p.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_lowercase() && bytes[1] == b':' {
+        p.replace_range(0..1, &(bytes[0] as char).to_ascii_uppercase().to_string());
+    }
+    (!p.is_empty()).then_some(p)
+}
+
+/// The conversation id of `...\.gemini\antigravity-cli\brain\<id>\.system_generated\logs\transcript.jsonl`.
+pub(crate) fn agy_id_of(path: &Path) -> Option<String> {
+    let id = path.ancestors().nth(3)?.file_name()?.to_string_lossy().into_owned();
+    crate::status::looks_like_id(&id).then_some(id)
+}
+
+/// Title from `~/.gemini/antigravity-cli/annotations/<id>.pbtxt`, e.g. `title:"..."`.
+pub(crate) fn agy_annotation_title(id: &str) -> Option<String> {
+    if !crate::status::looks_like_id(id) {
+        return None;
+    }
+    let text = fs::read_to_string(cli_home("agy").join("annotations").join(format!("{id}.pbtxt"))).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("title:") {
+            let val = rest.trim();
+            if let Ok(parsed) = serde_json::from_str::<String>(val) {
+                let t = parsed.trim().to_string();
+                if !t.is_empty() {
+                    return Some(t);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Strips the `<USER_REQUEST>...</USER_REQUEST>` envelope Antigravity wraps prompts in.
+pub(crate) fn agy_strip_user_prompt(raw: &str) -> String {
+    if let Some(after) = raw.split_once("<USER_REQUEST>").map(|(_, r)| r) {
+        if let Some((inner, _)) = after.split_once("</USER_REQUEST>") {
+            return inner.trim().to_string();
+        }
+    }
+    raw.trim().to_string()
+}
+
+/// Conversation id -> metadata from Antigravity's cache and history files (read-only).
+pub(crate) fn agy_metadata_map() -> std::collections::HashMap<String, AgyMeta> {
+    let mut map: std::collections::HashMap<String, AgyMeta> = std::collections::HashMap::new();
+    let root = cli_home("agy");
+    if let Ok(text) = fs::read_to_string(root.join("cache").join("conversation_metadata.json")) {
+        if let Ok(v) = serde_json::from_str::<Value>(&text) {
+            if let Some(convs) = v["conversations"].as_object() {
+                for (id, entry) in convs {
+                    let s = &entry["summary"];
+                    let cwd = s["WorkspaceURIs"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|u| u.as_str())
+                        .and_then(agy_file_uri_to_path)
+                        .unwrap_or_default();
+                    let title = s["Title"].as_str().unwrap_or("").trim().to_string();
+                    let preview = s["Preview"].as_str().unwrap_or("").trim().to_string();
+                    let is_internal = entry["is_internal"].as_bool().unwrap_or(false)
+                        || s["Internal"].as_bool().unwrap_or(false);
+                    map.insert(id.clone(), AgyMeta { cwd, title, preview, is_internal });
+                }
+            }
+        }
+    }
+    // `last_conversations.json` maps workspace path -> most recent conversation id,
+    // updated as soon as a conversation opens (before metadata cache may flush).
+    if let Ok(text) = fs::read_to_string(root.join("cache").join("last_conversations.json")) {
+        if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&text) {
+            for (ws, id_val) in obj {
+                let Some(id) = id_val.as_str() else { continue };
+                let entry = map.entry(id.to_string()).or_default();
+                if entry.cwd.is_empty() {
+                    entry.cwd = ws;
+                }
+            }
+        }
+    }
+    // Tail of `history.jsonl` fills in workspace/preview for brand-new conversations.
+    let hist = root.join("history.jsonl");
+    if let Ok(mut file) = File::open(&hist) {
+        let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let start = size.saturating_sub(256 * 1024);
+        if file.seek(SeekFrom::Start(start)).is_ok() {
+            let mut buf = Vec::with_capacity((size - start) as usize);
+            if file.read_to_end(&mut buf).is_ok() {
+                let text = String::from_utf8_lossy(&buf);
+                let mut lines = text.lines();
+                if start > 0 {
+                    lines.next();
+                }
+                for line in lines {
+                    let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+                    let Some(id) = v["conversationId"].as_str() else { continue };
+                    let entry = map.entry(id.to_string()).or_default();
+                    if entry.cwd.is_empty() {
+                        if let Some(ws) = v["workspace"].as_str() {
+                            entry.cwd = ws.to_string();
+                        }
+                    }
+                    if entry.preview.is_empty() {
+                        if let Some(d) = v["display"].as_str() {
+                            entry.preview = d.trim().to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    map
 }
 
 pub(crate) fn norm(p: &str) -> String {
@@ -320,6 +454,37 @@ fn parse_grok(v: &Value, out: &mut Vec<Msg>) {
     }
 }
 
+fn parse_agy(v: &Value, out: &mut Vec<Msg>) {
+    match v["type"].as_str() {
+        Some("USER_INPUT") => {
+            if let Some(s) = v["content"].as_str() {
+                let clean = agy_strip_user_prompt(s);
+                push_text(out, "user", &clean);
+            }
+        }
+        Some("PLANNER_RESPONSE") => {
+            if let Some(text) = v["response"]
+                .as_str()
+                .or_else(|| v["content"].as_str())
+                .or_else(|| v["text"].as_str())
+            {
+                push_text(out, "assistant", text);
+            }
+            if let Value::Array(calls) = &v["tool_calls"] {
+                for c in calls {
+                    push_call(out, c["name"].as_str().unwrap_or("tool"), &c["args"]);
+                }
+            }
+        }
+        Some("GENERIC") => {
+            if let Some(s) = v["content"].as_str() {
+                push_result(out, s);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[tauri::command(async)]
 pub fn transcript_load(
     cli: String,
@@ -328,7 +493,7 @@ pub fn transcript_load(
     end: Option<u64>,
     window: Option<u64>,
 ) -> Result<Transcript, String> {
-    if !matches!(cli.as_str(), "claude" | "codex" | "grok") {
+    if !matches!(cli.as_str(), "claude" | "codex" | "grok" | "agy") {
         return Err(format!("no session reader for: {cli}"));
     }
     // This tab's own conversation, wherever it is — or nothing. (Without an id it used
@@ -364,6 +529,7 @@ pub fn transcript_load(
         match cli.as_str() {
             "claude" => parse_claude(&v, &mut messages),
             "codex" => parse_codex(&v, &mut messages),
+            "agy" => parse_agy(&v, &mut messages),
             _ => parse_grok(&v, &mut messages),
         }
     }
@@ -378,6 +544,11 @@ pub fn transcript_load(
             (title, dir.file_name().map(|n| n.to_string_lossy().into_owned()))
         }
         "claude" => (None, path.file_stem().map(|n| n.to_string_lossy().into_owned())),
+        "agy" => {
+            let id = agy_id_of(&path);
+            let title = id.as_deref().and_then(agy_annotation_title);
+            (title, id)
+        }
         _ => (None, None),
     };
 
@@ -478,5 +649,29 @@ mod tests {
         let _ = fs::remove_file(&path);
         assert!(big.is_empty());
         assert_eq!(lines.len(), 5000);
+    }
+
+    #[test]
+    fn agy_helpers_parse_uris_prompts_ids_and_messages() {
+        assert_eq!(agy_file_uri_to_path("file:///e:/My%20Files/term"), Some(r"E:\My Files\term".to_string()));
+        assert_eq!(agy_file_uri_to_path("file:///E:/terminal"), Some(r"E:\terminal".to_string()));
+        assert_eq!(
+            agy_strip_user_prompt("<USER_REQUEST>\nHello there\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\ntime\n</ADDITIONAL_METADATA>"),
+            "Hello there"
+        );
+        assert_eq!(agy_strip_user_prompt("  plain prompt  "), "plain prompt");
+        let p = PathBuf::from(r"C:\Users\me\.gemini\antigravity-cli\brain\d65584ac-a896-4d44-91d0-8810da5b3b72\.system_generated\logs\transcript.jsonl");
+        assert_eq!(agy_id_of(&p).as_deref(), Some("d65584ac-a896-4d44-91d0-8810da5b3b72"));
+
+        let mut msgs = Vec::new();
+        parse_agy(&serde_json::json!({"type": "USER_INPUT", "content": "<USER_REQUEST>\nFix bug\n</USER_REQUEST>"}), &mut msgs);
+        parse_agy(&serde_json::json!({"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "read_file", "args": {"Path": "a.rs"}}]}), &mut msgs);
+        parse_agy(&serde_json::json!({"type": "GENERIC", "content": "file contents"}), &mut msgs);
+        parse_agy(&serde_json::json!({"type": "PLANNER_RESPONSE", "response": "Fixed it."}), &mut msgs);
+        assert_eq!(msgs.len(), 4);
+        assert_eq!((msgs[0].role, msgs[0].kind, msgs[0].text.as_str()), ("user", "text", "Fix bug"));
+        assert_eq!((msgs[1].role, msgs[1].kind), ("tool", "call"));
+        assert_eq!((msgs[2].role, msgs[2].kind, msgs[2].text.as_str()), ("tool", "result", "file contents"));
+        assert_eq!((msgs[3].role, msgs[3].kind, msgs[3].text.as_str()), ("assistant", "text", "Fixed it."));
     }
 }

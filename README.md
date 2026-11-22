@@ -6,7 +6,7 @@
 ![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-FFC131)
 ![Terminal: xterm.js](https://img.shields.io/badge/terminal-xterm.js-2c4f7c)
 
-**One portable window for all your Claude Code, Codex and Grok Build sessions on Windows.**
+**One portable window for all your Claude Code, Codex, Grok Build and Antigravity sessions on Windows.**
 
 TermDeck replaces the pile of separate cmd and PowerShell windows you get when you run several
 AI coding CLIs at once. Every session is a tab in a side panel that shows what it is doing —
@@ -18,21 +18,22 @@ them in an SDK or keep its own copy of your conversations.
 
 ## Highlights
 
-- **Many sessions, one window.** Claude Code, Codex, Grok Build, PowerShell, cmd, Git Bash
-  and WSL tabs. Show 1, 2 or 3 at once; they stack top-to-bottom on a portrait monitor.
-  Drag the lines between them to resize; **Reset sizes** puts everything back.
+- **Many sessions, one window.** Claude Code, Codex, Grok Build, Antigravity (`agy`), PowerShell,
+  cmd, Git Bash and WSL tabs. Show 1, 2 or 3 at once; they stack top-to-bottom on a portrait
+  monitor. Drag the lines between them to resize; **Reset sizes** puts everything back.
 - **Status at a glance.** Each tab shows working, finished, needs you (permission prompt
   or question), idle or ended, plus its topic, folder, CPU and memory. Optional taskbar
   flash and sound when a session finishes or needs you.
-- **Restart without losing your place.** After a restart every tab is back in its folder,
-  with a one-click **Resume** (or **Resume all**) that reopens the right conversation with the
-  same switches it was started with — `--dangerously-skip-permissions`, `--model`, and so on.
+- **Restart without losing your place.** After a restart — or after exiting a CLI with Ctrl+C —
+  every tab stays in its folder with a one-click **Resume** (or **Resume all**) that reopens the
+  right conversation with the same switches it was started with — `--dangerously-skip-permissions`,
+  `--model`, and so on.
 - **Past conversations.** Pick any earlier conversation from the CLIs' own session lists and
   reopen it in a new tab. A History view reads the conversation straight from the CLI's
   session file.
 - **Usage and emergency stop.** See every process a tab started, how much CPU and memory
   each uses, set it to low priority, or end the whole tree at once.
-- **CLI updates in one place.** Check and update all three CLIs from one panel, optionally at
+- **CLI updates in one place.** Check and update your CLIs from one panel, optionally at
   startup before any session opens (so nothing blocks the update), then resume everything.
 - **Snippets.** A searchable library of prompts and commands, with pinned quick buttons
   under the terminal.
@@ -56,7 +57,7 @@ More in the [wiki](https://github.com/aivrar/TermDeck/wiki).
 
 ## Download and run
 
-1. Download [`TermDeck-0.1.3-portable.zip`](https://github.com/aivrar/TermDeck/releases/download/v0.1.3/TermDeck-0.1.3-portable.zip)
+1. Download [`TermDeck-0.1.4-portable.zip`](https://github.com/aivrar/TermDeck/releases/download/v0.1.4/TermDeck-0.1.4-portable.zip)
    from the [latest release](https://github.com/aivrar/TermDeck/releases/latest).
 2. Unzip it anywhere — another drive or a USB stick is fine.
 3. Run `TermDeck.exe`.
@@ -70,15 +71,18 @@ The exe is not code-signed, so Windows SmartScreen may warn the first time
   normally already present on Windows 10).
 - The CLIs you want to use, installed and signed in the usual way:
   [Claude Code](https://docs.anthropic.com/en/docs/claude-code),
-  [Codex](https://github.com/openai/codex), Grok Build. TermDeck finds them on your `PATH`.
+  [Codex](https://github.com/openai/codex), Grok Build,
+  [Antigravity (`agy`)](https://antigravity.google). TermDeck finds them on your `PATH` (and in
+  their standard per-user install folders).
 - Optional: Git for Windows (Git Bash tabs), WSL (WSL tabs).
 
 ## What it reads, writes and sends
 
 - **Writes** only its own `data` folder: tabs and layout, settings, snippets, window size, and
   pasted images.
-- **Reads** the CLIs' own session folders (`%USERPROFILE%\.claude`, `.codex`, `.grok`) to show
-  status, history and past conversations. It never writes to them.
+- **Reads** the CLIs' own session folders (`%USERPROFILE%\.claude`, `.codex`, `.grok`,
+  `.gemini\antigravity-cli`) to show status, history and past conversations. It never writes to
+  them.
 - **Network:** none of its own. To check for CLI updates it runs `npm view` (public npm
   registry) for Claude Code and Codex and `grok update --check` for Grok. Updating a CLI
   runs that CLI's own update command.
@@ -124,5 +128,5 @@ in `src-tauri`. Details: [wiki → Building from source](https://github.com/aivr
 MIT — see [LICENSE](LICENSE). Bundled fonts and the ConPTY files are © Microsoft and
 under their own licences; see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
-TermDeck is an independent project, not affiliated with or endorsed by Anthropic, OpenAI
-or xAI. Claude Code, Codex and Grok are their respective owners' products.
+TermDeck is an independent project, not affiliated with or endorsed by Anthropic, OpenAI,
+xAI or Google. Claude Code, Codex, Grok and Antigravity are their respective owners' products.

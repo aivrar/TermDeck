@@ -30,6 +30,7 @@
   --claude: #d98a63;
   --codex: #7fd6c2;
   --grok: #b9a3ff;
+  --agy: #68b5ff;
   --sb-w: 230px;
   --lib-w: 280px;
   --ui: 'Segoe UI', system-ui, sans-serif;
@@ -147,6 +148,7 @@ body.tab-dragging { cursor: grabbing; user-select: none; }
 .cli-claude { color: var(--claude); }
 .cli-codex { color: var(--codex); }
 .cli-grok { color: var(--grok); }
+.cli-agy { color: var(--agy); }
 
 /* ---------- panes ---------- */
 #main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }

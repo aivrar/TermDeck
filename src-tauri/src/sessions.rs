@@ -1,13 +1,15 @@
-//! Live state of Codex and Grok sessions, read from the files those CLIs write
-//! themselves (read-only). Claude Code publishes its state in a simpler per-process
+//! Live state of Codex, Grok and Antigravity sessions, read from the files those CLIs
+//! write themselves (read-only). Claude Code publishes its state in a simpler per-process
 //! file, handled in status.rs.
 //!
-//!   Codex: ~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl
-//!          event_msg task_started ... task_complete
-//!   Grok:  ~/.grok/sessions/<url-encoded cwd>/<id>/events.jsonl
-//!          turn_started ... permission_requested / permission_resolved ... turn_ended
+//!   Codex:       ~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl
+//!                event_msg task_started ... task_complete
+//!   Grok:        ~/.grok/sessions/<url-encoded cwd>/<id>/events.jsonl
+//!                turn_started ... permission_requested / permission_resolved ... turn_ended
+//!   Antigravity: ~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl
+//!                USER_INPUT / PLANNER_RESPONSE / GENERIC
 
-use crate::transcript::{codex_recent_files, mtime, norm, percent_decode};
+use crate::transcript::{agy_annotation_title, agy_id_of, agy_metadata_map, codex_recent_files, mtime, norm, percent_decode};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -98,6 +100,7 @@ pub struct Live {
     pub session_id: Option<String>,
     /// "busy" | "idle" | "waiting"
     pub status: Option<String>,
+    pub session_name: Option<String>,
 }
 
 fn codex_cwd_of(inner: &mut Inner, file: &Path) -> Option<String> {
@@ -146,6 +149,28 @@ fn sessions_by_folder(inner: &mut Inner, cli: &str, folders: &HashSet<String>) -
                 out.entry(cwd).or_default().push(Cand { created, modified, path: f });
             }
         }
+    } else if cli == "agy" {
+        let meta = agy_metadata_map();
+        let brain = crate::transcript::cli_home("agy").join("brain");
+        for entry in fs::read_dir(brain).into_iter().flatten().flatten() {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if !crate::status::looks_like_id(&id) {
+                continue;
+            }
+            let Some(m) = meta.get(&id) else { continue };
+            if m.is_internal || m.cwd.is_empty() {
+                continue;
+            }
+            let cwd = norm(&m.cwd);
+            if !folders.contains(&cwd) {
+                continue;
+            }
+            let file = entry.path().join(".system_generated").join("logs").join("transcript.jsonl");
+            if file.is_file() {
+                let (created, modified) = times(&file);
+                out.entry(cwd).or_default().push(Cand { created, modified, path: file });
+            }
+        }
     } else {
         let root = crate::transcript::cli_home("grok").join("sessions");
         for entry in fs::read_dir(root).into_iter().flatten().flatten() {
@@ -165,10 +190,10 @@ fn sessions_by_folder(inner: &mut Inner, cli: &str, folders: &HashSet<String>) -
 
 /// When a session was last written to.
 fn touched(cli: &str, path: &Path) -> SystemTime {
-    if cli == "codex" {
-        mtime(path)
-    } else {
+    if cli == "grok" {
         mtime(&path.join("events.jsonl")).max(mtime(&path.join("chat_history.jsonl")))
+    } else {
+        mtime(path)
     }
 }
 
@@ -292,7 +317,7 @@ fn rebind(inner: &mut Inner, wants: &[Want]) {
         }
     }
     // 2. Sessions that appeared, or were reopened, since the CLIs started.
-    for cli in ["codex", "grok"] {
+    for cli in ["codex", "grok", "agy"] {
         let at_start = cli == "grok";
         // Tabs whose session is known for a fact are not part of the guessing.
         let tabs: Vec<&Want> = wants.iter().filter(|w| w.cli == cli && !inner.by_fact.contains(&w.tab)).collect();
@@ -429,11 +454,58 @@ fn grok_state(dir: &Path) -> Option<String> {
     None
 }
 
+fn agy_state(file: &Path) -> Option<String> {
+    for line in tail_lines(file).iter().rev() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let Some(kind) = v["type"].as_str() else { continue };
+        let status = v["status"].as_str().unwrap_or("");
+        match kind {
+            "SYSTEM_MESSAGE" => continue,
+            "PLANNER_RESPONSE" => {
+                if matches!(status, "RUNNING" | "GENERATING") {
+                    return Some("busy".into());
+                }
+                if matches!(status, "WAITING" | "WAITING_FOR_USER") {
+                    return Some("waiting".into());
+                }
+                if matches!(status, "CANCELED" | "CANCELLED" | "ERROR") {
+                    return Some("idle".into());
+                }
+                if let Some(calls) = v["tool_calls"].as_array().filter(|a| !a.is_empty()) {
+                    if calls.iter().any(|c| c["name"].as_str() == Some("ask_question")) {
+                        return Some("waiting".into());
+                    }
+                    return Some("busy".into());
+                }
+                return Some("idle".into());
+            }
+            "USER_INPUT" | "GENERIC" => {
+                if matches!(status, "CANCELED" | "CANCELLED") {
+                    return Some("idle".into());
+                }
+                return Some("busy".into());
+            }
+            _ => {
+                if matches!(status, "RUNNING" | "GENERATING") {
+                    return Some("busy".into());
+                }
+                if matches!(status, "WAITING" | "WAITING_FOR_USER") {
+                    return Some("waiting".into());
+                }
+                if matches!(status, "DONE" | "CANCELED" | "CANCELLED" | "ERROR") {
+                    return Some("idle".into());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// The state of a session, read from its file only when the file has changed since
 /// the last look. (It used to be read — up to 256 KB — once a second per tab, changed
 /// or not.)
 fn state_of(inner: &mut Inner, cli: &str, path: &Path) -> Option<String> {
-    let file = if cli == "codex" { path.to_path_buf() } else { path.join("events.jsonl") };
+    let file = if cli == "grok" { path.join("events.jsonl") } else { path.to_path_buf() };
     let stamp = fs::metadata(&file).ok().map(|m| (m.len(), m.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
     if let (Some((len, at)), Some((seen_len, seen_at, state))) = (stamp, inner.states.get(path)) {
         if *seen_len == len && *seen_at == at {
@@ -442,7 +514,11 @@ fn state_of(inner: &mut Inner, cli: &str, path: &Path) -> Option<String> {
     }
     // The size and time were taken before reading: if the file grows meanwhile, the
     // next look sees a different size and reads again.
-    let state = if cli == "codex" { codex_state(path) } else { grok_state(path) };
+    let state = match cli {
+        "codex" => codex_state(path),
+        "agy" => agy_state(path),
+        _ => grok_state(path),
+    };
     match stamp {
         Some((len, at)) => {
             inner.states.insert(path.to_path_buf(), (len, at, state.clone()));
@@ -500,6 +576,15 @@ pub fn locate(cli: &str, id: &str) -> Option<PathBuf> {
             .flatten()
             .map(|e| e.path().join(id))
             .find(|p| p.join("chat_history.jsonl").is_file()),
+        "agy" => {
+            let p = crate::transcript::cli_home("agy")
+                .join("brain")
+                .join(id)
+                .join(".system_generated")
+                .join("logs")
+                .join("transcript.jsonl");
+            p.is_file().then_some(p)
+        }
         _ => None,
     }
 }
@@ -573,16 +658,22 @@ impl SessionCache {
             .iter()
             .map(|(w, path)| {
                 let live = match path.as_ref() {
-                    None => Live { session_id: None, status: None },
+                    None => Live { session_id: None, status: None, session_name: None },
                     Some(path) if w.cli == "codex" => {
                         // rollout-2026-11-11T13-28-15-<uuid>.jsonl — the id is the last 36 characters.
                         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                         let id = codex_id_of(&stem).map(str::to_string);
-                        Live { session_id: id, status: state_of(inner, "codex", path) }
+                        Live { session_id: id, status: state_of(inner, "codex", path), session_name: None }
+                    }
+                    Some(path) if w.cli == "agy" => {
+                        let id = agy_id_of(path);
+                        let session_name = id.as_deref().and_then(agy_annotation_title);
+                        Live { session_id: id, status: state_of(inner, "agy", path), session_name }
                     }
                     Some(path) => Live {
                         session_id: path.file_name().map(|n| n.to_string_lossy().into_owned()),
                         status: state_of(inner, "grok", path),
+                        session_name: None,
                     },
                 };
                 (w.tab.clone(), live)
@@ -750,12 +841,12 @@ mod tests {
     #[test]
     fn only_something_that_looks_like_an_id_is_looked_up() {
         for bad in ["", "..", "..\\..\\x", "../../../etc", "a b c d e f g h", "abc", "C:\\Windows\\win.ini", "*", "noDigitsHereAtAll"] {
-            for cli in ["claude", "codex", "grok"] {
+            for cli in ["claude", "codex", "grok", "agy"] {
                 assert_eq!(locate(cli, bad), None, "{cli} {bad}");
             }
         }
         // Well-formed but unknown: not found, for every CLI.
-        for cli in ["claude", "codex", "grok", "other"] {
+        for cli in ["claude", "codex", "grok", "agy", "other"] {
             assert_eq!(locate(cli, "00000000-0000-4000-8000-000000000000"), None);
         }
     }
@@ -769,5 +860,43 @@ mod tests {
         assert_eq!(locate_remembering(&mut inner, "codex", id), None);
         // The second question was answered from memory: the note is the first one's.
         assert_eq!(inner.missing[&("codex".to_string(), id.to_string())], first);
+    }
+
+    #[test]
+    fn agy_state_reads_busy_waiting_and_idle_from_transcript() {
+        let dir = scratch("agy-state");
+        let file = dir.join("transcript.jsonl");
+        let mut inner = Inner::default();
+
+        // User sent a prompt -> busy
+        fs::write(&file, "{\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"content\":\"hi\"}\n").unwrap();
+        assert_eq!(state_of(&mut inner, "agy", &file).as_deref(), Some("busy"));
+
+        // Model calls a normal tool -> busy
+        let mut f = File::options().append(true).open(&file).unwrap();
+        writeln!(f, "{{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"tool_calls\":[{{\"name\":\"read_file\",\"args\":{{}}}}]}}").unwrap();
+        drop(f);
+        assert_eq!(state_of(&mut inner, "agy", &file).as_deref(), Some("busy"));
+
+        // Model asks the user a question -> waiting
+        let mut f = File::options().append(true).open(&file).unwrap();
+        writeln!(f, "{{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"tool_calls\":[{{\"name\":\"ask_question\",\"args\":{{}}}}]}}").unwrap();
+        drop(f);
+        assert_eq!(state_of(&mut inner, "agy", &file).as_deref(), Some("waiting"));
+
+        // Tool returns -> busy again
+        let mut f = File::options().append(true).open(&file).unwrap();
+        writeln!(f, "{{\"type\":\"GENERIC\",\"status\":\"DONE\",\"content\":\"answer\"}}").unwrap();
+        drop(f);
+        assert_eq!(state_of(&mut inner, "agy", &file).as_deref(), Some("busy"));
+
+        // Final model response with no tool calls -> idle
+        let mut f = File::options().append(true).open(&file).unwrap();
+        writeln!(f, "{{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"response\":\"All done!\"}}").unwrap();
+        writeln!(f, "{{\"type\":\"SYSTEM_MESSAGE\",\"status\":\"DONE\",\"content\":\"note\"}}").unwrap();
+        drop(f);
+        assert_eq!(state_of(&mut inner, "agy", &file).as_deref(), Some("idle"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

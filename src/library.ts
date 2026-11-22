@@ -1,7 +1,7 @@
 import { api, type CliKind } from './api';
 import { h, modal, toast, uid } from './ui';
 
-export type SnippetScope = 'all' | 'claude' | 'codex' | 'grok' | 'shell';
+export type SnippetScope = 'all' | 'claude' | 'codex' | 'grok' | 'agy' | 'shell';
 
 export interface Snippet {
   id: string;
@@ -29,6 +29,7 @@ const SCOPE_LABEL: Record<SnippetScope, string> = {
   claude: 'Claude Code',
   codex: 'Codex',
   grok: 'Grok',
+  agy: 'Antigravity',
   shell: 'Plain shell',
 };
 
@@ -40,6 +41,7 @@ function starter(): Snippet[] {
     s('claude', 'claude', 'submit', 'shell', 'Start a CLI'),
     s('codex', 'codex', 'submit', 'shell', 'Start a CLI'),
     s('grok', 'grok', 'submit', 'shell', 'Start a CLI'),
+    s('agy', 'agy', 'submit', 'shell', 'Start a CLI'),
     s('git status', 'git status', 'submit', 'shell', 'Commands'),
     s('Summarize', 'Summarize what you changed, what you verified, and what is still left to do.', 'insert', 'all', 'Prompts'),
     s('Plan first', 'Before changing anything, explain your plan and wait for my go-ahead.', 'insert', 'all', 'Prompts'),

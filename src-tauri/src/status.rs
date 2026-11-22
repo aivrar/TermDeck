@@ -230,6 +230,7 @@ pub(crate) fn looks_like_id(s: &str) -> bool {
 
 /// The session id a CLI was started with, if its command line names one.
 ///   codex resume <id> ...        grok -r <id> | --resume <id> | --resume=<id> | -s / --session-id <id>
+///   agy --conversation <id> | --conversation=<id>
 pub(crate) fn named_session(cli: &str, args: &[String]) -> Option<String> {
     match cli {
         "codex" => {
@@ -246,6 +247,21 @@ pub(crate) fn named_session(cli: &str, args: &[String]) -> Option<String> {
                     }
                 }
                 if matches!(a.as_str(), "-r" | "--resume" | "-s" | "--session-id") {
+                    if let Some(v) = args.get(i + 1).filter(|v| looks_like_id(v)) {
+                        return Some(v.clone());
+                    }
+                }
+            }
+            None
+        }
+        "agy" => {
+            for (i, a) in args.iter().enumerate() {
+                if let Some(v) = a.strip_prefix("--conversation=") {
+                    if looks_like_id(v) {
+                        return Some(v.to_string());
+                    }
+                }
+                if a == "--conversation" {
                     if let Some(v) = args.get(i + 1).filter(|v| looks_like_id(v)) {
                         return Some(v.clone());
                     }
@@ -452,6 +468,8 @@ fn classify(name: &str) -> Option<&'static str> {
         Some("grok")
     } else if stem == "codex" || stem.starts_with("codex-") {
         Some("codex")
+    } else if stem == "agy" {
+        Some("agy")
     } else {
         None
     }
@@ -560,9 +578,9 @@ pub fn poll_status(
             if let Some(pid) = st.cli_pid {
                 st.cli_args = crate::usage::arguments(pid);
             }
-            // Codex and Grok: state comes from the session files they write (filled in below).
+            // Codex, Grok and Antigravity: state comes from the session files they write (filled in below).
             if let (Some(cli), Some(pid)) = (st.cli.as_deref(), st.cli_pid) {
-                if cli == "codex" || cli == "grok" {
+                if matches!(cli, "codex" | "grok" | "agy") {
                     if let Some(started) = process_start(pid) {
                         wants.push(Want {
                             tab: st.id.clone(),
@@ -601,12 +619,15 @@ pub fn poll_status(
                 st.waiting_for = s.waiting_for.and_then(|w| w.as_str().map(|x| x.to_string()));
                 st.cli_cwd = s.cwd;
             }
-            // (Only for a tab running Codex or Grok: a reading kept from an earlier look
-            // can name a tab whose CLI has changed since.)
-            if matches!(st.cli.as_deref(), Some("codex") | Some("grok")) {
+            // (Only for a tab running Codex, Grok or Antigravity: a reading kept from an
+            // earlier look can name a tab whose CLI has changed since.)
+            if matches!(st.cli.as_deref(), Some("codex") | Some("grok") | Some("agy")) {
                 if let Some(live) = facts.lives.remove(&st.id) {
                     st.session_id = live.session_id;
                     st.cli_status = live.status;
+                    if live.session_name.is_some() {
+                        st.session_name = live.session_name;
+                    }
                 }
             }
             (st, all)
@@ -645,4 +666,25 @@ pub fn poll_status(
         st.procs.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then(b.mem.cmp(&a.mem)));
     }
     Poll { tabs: found.into_iter().map(|(st, _)| st).collect(), system }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agy_process_and_conversation_flag_are_recognised() {
+        assert_eq!(classify("agy.exe"), Some("agy"));
+        assert_eq!(classify("agy"), Some("agy"));
+        let id = "d65584ac-a896-4d44-91d0-8810da5b3b72";
+        assert_eq!(
+            named_session("agy", &[format!("--conversation={id}"), "--dangerously-skip-permissions".into()]),
+            Some(id.to_string())
+        );
+        assert_eq!(
+            named_session("agy", &["--conversation".into(), id.into()]),
+            Some(id.to_string())
+        );
+        assert_eq!(named_session("agy", &["--conversation".into(), "../bad".into()]), None);
+    }
 }

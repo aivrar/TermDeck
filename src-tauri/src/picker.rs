@@ -3,7 +3,10 @@
 //! Only the start of each file is read, and only for the newest files, so a large
 //! history costs little.
 
-use crate::transcript::{codex_recent_files, mtime, norm, percent_decode};
+use crate::transcript::{
+    agy_annotation_title, agy_id_of, agy_metadata_map, agy_strip_user_prompt, codex_recent_files, mtime, norm,
+    percent_decode,
+};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs::{self, File};
@@ -147,6 +150,21 @@ fn grok_first(chat: &Path) -> String {
     String::new()
 }
 
+fn agy_first(transcript: &Path) -> String {
+    for line in head_lines(transcript) {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        if v["type"].as_str() == Some("USER_INPUT") {
+            if let Some(raw) = v["content"].as_str() {
+                let clean = agy_strip_user_prompt(raw);
+                if !clean.is_empty() {
+                    return one_line(&clean);
+                }
+            }
+        }
+    }
+    String::new()
+}
+
 fn newest(mut files: Vec<(SystemTime, PathBuf)>, limit: usize) -> Vec<(SystemTime, PathBuf)> {
     files.sort_by(|a, b| b.0.cmp(&a.0));
     files.truncate(limit);
@@ -249,6 +267,46 @@ pub fn sessions_list(cli: String, cwd: Option<String>, limit: Option<usize>) -> 
                     title,
                     modified: millis(m),
                     size: fs::metadata(&chat).map(|x| x.len()).unwrap_or(0),
+                });
+            }
+        }
+        "agy" => {
+            let meta = agy_metadata_map();
+            let brain = crate::transcript::cli_home("agy").join("brain");
+            let mut files = Vec::new();
+            for entry in fs::read_dir(&brain).into_iter().flatten().flatten() {
+                let id = entry.file_name().to_string_lossy().into_owned();
+                if meta.get(&id).is_some_and(|m| m.is_internal) {
+                    continue;
+                }
+                if let Some(w) = &want {
+                    let Some(m) = meta.get(&id) else { continue };
+                    if m.cwd.is_empty() || &norm(&m.cwd) != w {
+                        continue;
+                    }
+                }
+                let tr = entry.path().join(".system_generated").join("logs").join("transcript.jsonl");
+                if tr.is_file() {
+                    files.push((mtime(&tr), tr));
+                }
+            }
+            for (m, tr) in newest(files, limit) {
+                let id = agy_id_of(&tr).unwrap_or_default();
+                let info = meta.get(&id);
+                let cwd = info.map(|x| x.cwd.clone()).unwrap_or_default();
+                let title = agy_annotation_title(&id)
+                    .map(|t| one_line(&t))
+                    .or_else(|| info.filter(|x| !x.title.is_empty()).map(|x| one_line(&x.title)))
+                    .or_else(|| info.filter(|x| !x.preview.is_empty()).map(|x| one_line(&x.preview)))
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| agy_first(&tr));
+                out.push(SessionInfo {
+                    cli: cli.clone(),
+                    id,
+                    cwd,
+                    title,
+                    modified: millis(m),
+                    size: fs::metadata(&tr).map(|x| x.len()).unwrap_or(0),
                 });
             }
         }

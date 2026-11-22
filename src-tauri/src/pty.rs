@@ -386,9 +386,10 @@ fn build_command(a: &SpawnArgs) -> Result<CommandBuilder, String> {
     Ok(cmd)
 }
 
-/// The three CLIs install into per-user folders that are not always on PATH
-/// (Claude Code's is not on this machine). Appending them means typing `claude`,
-/// `codex` or `grok` works in every tab. Existing PATH order is left untouched.
+/// The CLIs install into per-user folders that are not always on PATH
+/// (Claude Code's and Antigravity's are not always on PATH). Appending them means
+/// typing `claude`, `codex`, `grok` or `agy` works in every tab. Existing PATH order
+/// is left untouched.
 pub(crate) fn path_with_cli_dirs(home: &str) -> String {
     let current = std::env::var("PATH").unwrap_or_default();
     let have: Vec<String> = current
@@ -398,6 +399,9 @@ pub(crate) fn path_with_cli_dirs(home: &str) -> String {
     let mut extra = vec![format!(r"{home}\.local\bin"), format!(r"{home}\.grok\bin")];
     if let Ok(appdata) = std::env::var("APPDATA") {
         extra.push(format!(r"{appdata}\npm"));
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        extra.push(format!(r"{local}\agy\bin"));
     }
     let mut path = current.clone();
     for dir in extra {

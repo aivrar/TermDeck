@@ -188,8 +188,8 @@ try {
     t.applyStatus(st(null, []), false);
     return out;
   }, d);
-  check('typed in by hand for Claude Code: kept while Claude Code runs (not read from the process), and after it is closed',
-    flags.sameCli.flags === '--dangerously-skip-permissions' && flags.sameCli.manual && flags.closed.flags === '--dangerously-skip-permissions' && flags.closed.cli === 'none', JSON.stringify([flags.sameCli, flags.closed]));
+  check('typed in by hand for Claude Code: kept while Claude Code runs (not read from the process), and offered for Resume after it is closed',
+    flags.sameCli.flags === '--dangerously-skip-permissions' && flags.sameCli.manual && flags.closed.flags === '--dangerously-skip-permissions' && flags.closed.cli === 'claude', JSON.stringify([flags.sameCli, flags.closed]));
   check('Claude Code started again in the tab: its Resume has them', /^claude --dangerously-skip-permissions$/.test(flags.sameCliAgain.cmd ?? ''), String(flags.sameCliAgain.cmd));
   check('Codex started in the tab instead: they are let go, and Codex is remembered with its own', !flags.otherCli.manual && !/dangerously/.test(flags.otherCli.cmd ?? '') && /^codex -m /.test(flags.otherCli.cmd ?? ''), JSON.stringify(flags.otherCli));
   check('a tab saved before this: the CLI is noted when it closes, and another CLI then starts clean', flags.legacyNoted.of === 'claude' && flags.legacyOther.cmd === 'grok', JSON.stringify([flags.legacyNoted, flags.legacyOther]));
